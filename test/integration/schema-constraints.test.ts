@@ -3,7 +3,13 @@ import type { SQL } from 'bun';
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { newId } from '../../src/common/ids';
 import { Money } from '../../src/common/money/money';
-import { createTestOrm, createTestSql, expectConstraintViolation, resetSchema } from '../support/database';
+import {
+  capturePostgresError,
+  createTestOrm,
+  createTestSql,
+  expectConstraintViolation,
+  resetSchema,
+} from '../support/database';
 
 type Row = Record<string, unknown>;
 type Direction = 'DEBIT' | 'CREDIT';
@@ -198,6 +204,52 @@ async function seedWallet(initialBalance = '100.00'): Promise<WalletFixture> {
     });
   });
   return wallet;
+}
+
+async function waitForLockWaiters(count: number): Promise<void> {
+  for (let attempt = 0; attempt < 200; attempt++) {
+    const [{ waiting }] = await sql`
+      select count(*)::int as waiting from pg_stat_activity
+      where datname = current_database() and wait_event_type = 'Lock'`;
+    if (waiting >= count) {
+      return;
+    }
+    await Bun.sleep(10);
+  }
+  throw new Error(`expected ${count} session(s) waiting on a lock`);
+}
+
+async function walletState(wallet: WalletFixture) {
+  const [state] = await sql`
+    select w.version, w.balance_amount,
+           (select count(*)::int from wallet_ledger_entries e where e.wallet_id = w.id) as entries,
+           (select max(wallet_version) from wallet_ledger_entries e where e.wallet_id = w.id) as head_version
+    from wallets w where w.id = ${wallet.id}`;
+  return state;
+}
+
+async function transactionExists(id: unknown): Promise<boolean> {
+  const rows = await sql`select 1 from wager_transactions where id = ${id}`;
+  return rows.length > 0;
+}
+
+/** A forged credit: a processed transaction plus its ledger entry, without touching the wallet. */
+async function insertForgedEntry(tx: SQL, wallet: WalletFixture, walletVersion: number, overrides: Row = {}) {
+  const transaction = transactionRow(wallet, { kind: 'WIN', amount: '1000.00', observed_balance_amount: '1000.00', ...overrides });
+  await insert(tx, 'wager_transactions', transaction);
+  await insert(tx, 'wallet_ledger_entries', {
+    id: newId(),
+    wallet_id: wallet.id,
+    transaction_id: transaction.id,
+    direction: 'CREDIT',
+    amount: transaction.amount,
+    currency: wallet.currency,
+    balance_before: '0.00',
+    balance_after: transaction.amount,
+    wallet_version: walletVersion,
+    created_at: now,
+  });
+  return transaction;
 }
 
 /** A row that is only checked by single-table constraints (foreign keys are deferred and the tx rolls back). */
@@ -479,18 +531,37 @@ describe('UNIQUE constraints and indexes', () => {
     );
   });
 
-  test('a wallet version has at most one ledger entry', async () => {
+  test('a wallet version has at most one ledger entry, even when two transactions race for it', async () => {
     const wallet = await seedWallet('100.00');
     const first = movement(wallet, 'DEBIT');
     const second = movement(wallet, 'DEBIT');
-    await expectConstraintViolation(
-      sql.begin(async (tx) => {
-        await applyMovement(tx, wallet, first);
-        await insert(tx, 'wager_transactions', second.transaction);
-        await insert(tx, 'wallet_ledger_entries', second.entry);
-      }),
-      'wallet_ledger_entries_wallet_version_uq',
-    );
+    let releaseFirst!: () => void;
+    const firstMayCommit = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let firstInserted!: () => void;
+    const firstHasInserted = new Promise<void>((resolve) => {
+      firstInserted = resolve;
+    });
+
+    // Both read the same chain head (version 1); the second waits on the unique index until the first commits.
+    const firstCommit = sql.begin(async (tx) => {
+      await insert(tx, 'wager_transactions', first.transaction);
+      await insert(tx, 'wallet_ledger_entries', first.entry);
+      firstInserted();
+      await firstMayCommit;
+      await tx`update wallets set balance_amount = ${first.balanceAfter}, version = ${first.version} where id = ${wallet.id}`;
+    });
+    await firstHasInserted;
+    const secondCommit = sql.begin(async (tx) => {
+      await insert(tx, 'wager_transactions', second.transaction);
+      await insert(tx, 'wallet_ledger_entries', second.entry);
+    });
+    await waitForLockWaiters(1);
+    releaseFirst();
+
+    await firstCommit;
+    await expectConstraintViolation(secondCommit, 'wallet_ledger_entries_wallet_version_uq');
   });
 
   test('a reference is reversed at most once, by REFUND or ROLLBACK', async () => {
@@ -768,6 +839,144 @@ describe('wallet and ledger consistency (constraint triggers)', () => {
     move.entry.wallet_version = 3;
     move.version = 3;
     await expectConstraintViolation(sql.begin((tx) => applyMovement(tx, wallet, move)), 'wallet_ledger_entries_chain');
+  });
+});
+
+describe('ledger head integrity (Migration20261125180000LedgerHeadIntegrity)', () => {
+  test('a wallet opened with zero balance has no entries and stays at version 1', async () => {
+    const wallet = await seedWallet('0.00');
+    expect(await walletState(wallet)).toEqual({ version: 1, balance_amount: '0.00', entries: 0, head_version: null });
+  });
+
+  test('a forged WIN at version 1 of a zero-balance wallet is rejected at COMMIT and rolled back', async () => {
+    const wallet = await seedWallet('0.00');
+    let forged: Row | undefined;
+
+    const error = await capturePostgresError(
+      sql.begin(async (tx) => {
+        forged = await insertForgedEntry(tx, wallet, 1);
+      }),
+    );
+
+    expect(error).toMatchObject({ errno: '23514', constraint: 'wallet_ledger_entries_opening_version' });
+    expect(await transactionExists(forged!.id)).toBe(false);
+    expect(await walletState(wallet)).toEqual({ version: 1, balance_amount: '0.00', entries: 0, head_version: null });
+  });
+
+  test('the same forgery after the wallet has moved is rejected as a retroactive entry', async () => {
+    const wallet = await seedWallet('0.00');
+    await commitMovement(wallet, 'CREDIT', { kind: 'WIN', amount: '5.00' });
+
+    const error = await capturePostgresError(sql.begin((tx) => insertForgedEntry(tx, wallet, 1)));
+
+    expect(error.constraint).toBe('wallet_ledger_entries_chain');
+    expect(error.message).toContain('must be appended at version 3, got version 1');
+    expect(await walletState(wallet)).toEqual({ version: 2, balance_amount: '5.00', entries: 1, head_version: 2 });
+  });
+
+  test('an entry below the head of a longer chain is rejected', async () => {
+    const wallet = await seedWallet('100.00');
+    await commitMovement(wallet, 'DEBIT');
+    await commitMovement(wallet, 'DEBIT');
+    const retroactive = movement(wallet, 'DEBIT');
+    retroactive.entry.wallet_version = 2;
+    retroactive.version = 2;
+
+    const error = await capturePostgresError(sql.begin((tx) => applyMovement(tx, wallet, retroactive)));
+
+    expect(error.constraint).toBe('wallet_ledger_entries_chain');
+    expect(error.message).toContain('must be appended at version 4, got version 2');
+  });
+
+  test('a skipped version is rejected', async () => {
+    const wallet = await seedWallet('100.00');
+    const skipped = movement(wallet, 'DEBIT');
+    skipped.entry.wallet_version = 3;
+    skipped.version = 3;
+
+    const error = await capturePostgresError(sql.begin((tx) => applyMovement(tx, wallet, skipped)));
+
+    expect(error.constraint).toBe('wallet_ledger_entries_chain');
+    expect(error.message).toContain('must be appended at version 2, got version 3');
+  });
+
+  test('the first entry of a wallet cannot start beyond version 2', async () => {
+    const wallet = await seedWallet('0.00');
+    const error = await capturePostgresError(sql.begin((tx) => insertForgedEntry(tx, wallet, 3)));
+    expect(error.constraint).toBe('wallet_ledger_entries_chain');
+    expect(error.message).toContain('has no predecessor');
+  });
+
+  test('a valid OPENING is the version 1 head of its wallet', async () => {
+    const wallet = await seedWallet('250.00');
+    expect(await walletState(wallet)).toEqual({ version: 1, balance_amount: '250.00', entries: 1, head_version: 1 });
+  });
+
+  test('OPENING cannot take any version other than 1', async () => {
+    const wallet = await seedWallet('0.00');
+    await expectConstraintViolation(
+      sql.begin((tx) =>
+        applyMovement(
+          tx,
+          wallet,
+          movement(wallet, 'CREDIT', {
+            kind: 'OPENING',
+            provider_id: 'internal',
+            external_transaction_id: `opening:${wallet.id}`,
+            idempotency_key: `opening:${wallet.id}`,
+            amount: '50.00',
+          }),
+        ),
+      ),
+      'wallet_ledger_entries_opening_version',
+    );
+  });
+
+  test('a valid balance change moves the wallet and the ledger head together', async () => {
+    const wallet = await seedWallet('100.00');
+    await commitMovement(wallet, 'DEBIT', { amount: '40.00' });
+    expect(await walletState(wallet)).toEqual({ version: 2, balance_amount: '60.00', entries: 2, head_version: 2 });
+  });
+
+  test('several movements in one SQL transaction are checked against the final state', async () => {
+    const wallet = await seedWallet('100.00');
+    await sql.begin(async (tx) => {
+      for (const direction of ['DEBIT', 'CREDIT', 'DEBIT'] as const) {
+        const move = movement(wallet, direction, direction === 'CREDIT' ? { kind: 'WIN', amount: '7.50' } : {});
+        await applyMovement(tx, wallet, move);
+        wallet.balance = Money.from({ amount: move.balanceAfter, currency: wallet.currency });
+        wallet.version = move.version;
+      }
+    });
+    expect(await walletState(wallet)).toEqual({ version: 4, balance_amount: '87.50', entries: 4, head_version: 4 });
+  });
+
+  test('a ledger head ahead of the wallet is rejected at COMMIT, even after a matching update', async () => {
+    const wallet = await seedWallet('100.00');
+    const matched = movement(wallet, 'DEBIT');
+    const ahead = movement({ ...wallet, balance: wallet.balance.subtract(Money.from({ amount: '10.00', currency: 'BRL' })), version: 2 }, 'DEBIT');
+
+    const error = await capturePostgresError(
+      sql.begin(async (tx) => {
+        await applyMovement(tx, wallet, matched);
+        await insert(tx, 'wager_transactions', ahead.transaction);
+        await insert(tx, 'wallet_ledger_entries', ahead.entry);
+      }),
+    );
+
+    expect(error.constraint).toBe('wallet_ledger_entries_match_wallet');
+    expect(error.message).toContain('ledger head of wallet');
+    expect(await transactionExists(matched.transaction.id)).toBe(false);
+    expect(await walletState(wallet)).toEqual({ version: 1, balance_amount: '100.00', entries: 1, head_version: 1 });
+  });
+
+  test('a wallet moved without a ledger entry is rejected and nothing is kept', async () => {
+    const wallet = await seedWallet('100.00');
+    await expectConstraintViolation(
+      sql`update wallets set balance_amount = 90, version = 2 where id = ${wallet.id}`,
+      'wallets_balance_matches_ledger',
+    );
+    expect(await walletState(wallet)).toEqual({ version: 1, balance_amount: '100.00', entries: 1, head_version: 1 });
   });
 });
 

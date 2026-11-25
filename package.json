@@ -10,11 +10,13 @@
     "test": "bun test",
     "test:unit": "bun test test/unit",
     "test:integration": "bun test test/integration",
+    "db:provision": "bun run src/database/provision.ts",
     "db:migrate": "bun run src/database/migrate.ts up",
     "db:migrate:down": "bun run src/database/migrate.ts down",
     "db:migrate:status": "bun run src/database/migrate.ts status",
     "infra:up": "docker compose up -d --wait",
-    "infra:down": "docker compose down -v"
+    "infra:down": "docker compose down",
+    "infra:destroy-volumes": "docker compose down -v"
   },
   "dependencies": {
     "@aws-sdk/client-sqs": "^3.1177.0",

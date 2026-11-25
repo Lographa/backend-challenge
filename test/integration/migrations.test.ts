@@ -47,16 +47,38 @@ afterAll(async () => {
   await orm.close();
 });
 
-describe('initial schema migration', () => {
+const MIGRATIONS = [
+  'Migration20261125140000InitialSchema',
+  'Migration20261125180000LedgerHeadIntegrity',
+  'Migration20261125180100ApplicationPrivileges',
+];
+
+async function applicationGrants(): Promise<number> {
+  const [{ grants }] = await sql`
+    select count(*)::int as grants from information_schema.role_table_grants
+    where table_schema = 'public' and grantee = 'wagering_application'`;
+  return grants;
+}
+
+async function functionSearchPaths(): Promise<Array<string | null>> {
+  const rows: Array<{ config: string | null }> = await sql`
+    select array_to_string(proconfig, ',') as config from pg_proc
+    where pronamespace = 'public'::regnamespace order by proname`;
+  return rows.map((row) => row.config);
+}
+
+describe('schema migrations', () => {
   test('down to zero leaves no tables or functions behind', async () => {
     expect(await tables()).toEqual([]);
     expect(await functions()).toEqual([]);
-    expect((await orm.migrator.getPending()).map((m) => m.name)).toEqual(['Migration20261125140000InitialSchema']);
+    expect((await orm.migrator.getPending()).map((m) => m.name)).toEqual(MIGRATIONS);
   });
 
-  test('up creates the five tables and their functions', async () => {
-    await orm.migrator.up();
+  test('up applies every migration in order and creates the five tables and their functions', async () => {
+    const applied = await orm.migrator.up();
 
+    expect(applied.map((m) => m.name)).toEqual(MIGRATIONS);
+    expect((await orm.migrator.getExecuted()).map((m) => m.name)).toEqual(MIGRATIONS);
     expect(await tables()).toEqual(TABLES);
     expect(await functions()).toEqual(FUNCTIONS);
     expect(await orm.migrator.getPending()).toEqual([]);
@@ -66,9 +88,24 @@ describe('initial schema migration', () => {
     expect(await orm.migrator.up()).toEqual([]);
   });
 
+  test('the corrective migrations revert to the initial schema and apply again', async () => {
+    expect(await applicationGrants()).toBeGreaterThan(0);
+    expect(await functionSearchPaths()).toEqual(FUNCTIONS.map(() => 'search_path=public, pg_temp'));
+
+    await orm.migrator.down({ to: 'Migration20261125140000InitialSchema' });
+    expect((await orm.migrator.getExecuted()).map((m) => m.name)).toEqual(['Migration20261125140000InitialSchema']);
+    expect(await tables()).toEqual(TABLES);
+    expect(await applicationGrants()).toBe(0);
+    expect(await functionSearchPaths()).toEqual(FUNCTIONS.map(() => null));
+
+    await orm.migrator.up();
+    expect((await orm.migrator.getExecuted()).map((m) => m.name)).toEqual(MIGRATIONS);
+    expect(await applicationGrants()).toBeGreaterThan(0);
+  });
+
   test('down and up can be repeated', async () => {
     for (let cycle = 0; cycle < 2; cycle++) {
-      await orm.migrator.down();
+      await orm.migrator.down({ to: 0 });
       expect(await tables()).toEqual([]);
       expect(await functions()).toEqual([]);
       await orm.migrator.up();
@@ -124,7 +161,7 @@ describe('initial schema migration', () => {
       })}`;
     });
 
-    await orm.migrator.down();
+    await orm.migrator.down({ to: 0 });
     expect(await tables()).toEqual([]);
     await orm.migrator.up();
     expect(await tables()).toEqual(TABLES);

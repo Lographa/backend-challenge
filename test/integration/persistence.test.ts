@@ -35,8 +35,13 @@ class SampleEvent extends IntegrationEvent<{ amount: string }> {
 let orm: MikroORM;
 
 beforeAll(async () => {
-  orm = await createTestOrm();
-  await resetSchema(orm);
+  const migrator = await createTestOrm('migrator');
+  try {
+    await resetSchema(migrator);
+  } finally {
+    await migrator.close();
+  }
+  orm = await createTestOrm('app');
 });
 
 afterAll(async () => {

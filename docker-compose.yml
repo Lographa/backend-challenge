@@ -3,6 +3,9 @@ name: wagering
 services:
   postgres:
     image: postgres:17-alpine
+    # POSTGRES_USER is the bootstrap superuser, used only by `bun run db:provision`
+    # (DATABASE_ADMIN_URL). Provisioning creates the migration and application users
+    # and works on new and existing volumes alike; see docs/database.md.
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-wagering}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-wagering}

@@ -4,7 +4,7 @@ import type { AppConfig } from '../common/config/env';
 import { entitySchemas } from './entities';
 import { migrations } from './migrations';
 
-export function createOrmOptions(config: AppConfig) {
+export function createOrmOptions(config: Pick<AppConfig, 'databaseUrl' | 'databasePoolMax'>) {
   return defineConfig({
     driver: PostgreSqlDriver,
     clientUrl: config.databaseUrl,
