@@ -1,7 +1,7 @@
 import type { MikroORM } from '@mikro-orm/postgresql';
 import type { SQL } from 'bun';
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
-import { createTestOrm, createTestSql } from '../support/database';
+import { createTestOrm, createTestSql, testRoleName } from '../support/database';
 
 const TABLES = ['inbox_messages', 'outbox_messages', 'wager_transactions', 'wallet_ledger_entries', 'wallets'];
 const FUNCTIONS = [
@@ -51,6 +51,8 @@ const MIGRATIONS = [
   'Migration20261125140000InitialSchema',
   'Migration20261125180000LedgerHeadIntegrity',
   'Migration20261125180100ApplicationPrivileges',
+  'Migration20261126100000OutboxSequence',
+  'Migration20261126110000OutboxSequenceIntegrity',
 ];
 
 async function applicationGrants(): Promise<number> {
@@ -101,6 +103,94 @@ describe('schema migrations', () => {
     await orm.migrator.up();
     expect((await orm.migrator.getExecuted()).map((m) => m.name)).toEqual(MIGRATIONS);
     expect(await applicationGrants()).toBeGreaterThan(0);
+  });
+
+  test('the outbox sequence numbers existing rows, and its down restores the previous guard', async () => {
+    const sequenceColumn = async () =>
+      (await sql`
+        select 1 from information_schema.columns
+        where table_name = 'outbox_messages' and column_name = 'sequence_number'`).length;
+    const guardSource = async () => {
+      const [{ source }] = await sql`select prosrc as source from pg_proc where proname = 'outbox_messages_guard'`;
+      return source as string;
+    };
+
+    await orm.migrator.down({ to: 'Migration20261125180100ApplicationPrivileges' });
+    expect(await sequenceColumn()).toBe(0);
+    expect(await guardSource()).not.toContain('sequence_number');
+    expect(await functionSearchPaths()).toEqual(FUNCTIONS.map(() => 'search_path=public, pg_temp'));
+
+    const aggregateId = Bun.randomUUIDv7();
+    for (const step of [1, 2]) {
+      await sql`insert into outbox_messages ${sql({
+        id: Bun.randomUUIDv7(),
+        aggregate_id: aggregateId,
+        event_type: 'existing.event',
+        payload: { step },
+        occurred_at: new Date(),
+        attempts: 0,
+      })}`;
+    }
+
+    await orm.migrator.up();
+    expect(await sequenceColumn()).toBe(1);
+    expect(await guardSource()).toContain('new.sequence_number');
+    expect(await functionSearchPaths()).toEqual(FUNCTIONS.map(() => 'search_path=public, pg_temp'));
+    const numbered = await sql`
+      select count(distinct sequence_number)::int as numbered from outbox_messages where aggregate_id = ${aggregateId}`;
+    expect(numbered).toEqual([{ numbered: 2 }]);
+  });
+
+  test('the outbox sequence integrity narrows INSERT, and its down restores the table-wide grant', async () => {
+    const appUser = testRoleName('app');
+    const migratorUser = testRoleName('migrator');
+    const app = createTestSql('app');
+    const outboxInsertPrivileges = async () =>
+      (await sql`
+        select has_table_privilege(${appUser}, 'outbox_messages', 'INSERT') as table_insert,
+               has_column_privilege(${appUser}, 'outbox_messages', 'sequence_number', 'INSERT') as sequence_number_insert,
+               (select relacl::text from pg_class where oid = 'outbox_messages'::regclass) as table_acl,
+               (select count(*)::int from pg_attribute where attrelid = 'outbox_messages'::regclass
+                  and attacl::text like '%wagering_application=a%') as column_insert_grants,
+               (select count(*)::int from pg_constraint where conname = 'outbox_messages_sequence_number_uq') as unique_constraints`)[0];
+    const insertAsApp = () =>
+      app`insert into outbox_messages ${app({
+        id: Bun.randomUUIDv7(),
+        aggregate_id: Bun.randomUUIDv7(),
+        event_type: 'after.migration',
+        payload: { ok: true },
+        occurred_at: new Date(),
+        attempts: 0,
+      })} returning sequence_number`;
+
+    try {
+      const narrowed = await outboxInsertPrivileges();
+      expect(narrowed).toEqual({
+        table_insert: false,
+        sequence_number_insert: false,
+        table_acl: `{${migratorUser}=arwdDxtm/${migratorUser},wagering_application=r/${migratorUser}}`,
+        column_insert_grants: 8,
+        unique_constraints: 1,
+      });
+
+      await orm.migrator.down({ to: 'Migration20261126100000OutboxSequence' });
+      expect(await outboxInsertPrivileges()).toEqual({
+        table_insert: true,
+        sequence_number_insert: true,
+        table_acl: `{${migratorUser}=arwdDxtm/${migratorUser},wagering_application=ar/${migratorUser}}`,
+        column_insert_grants: 0,
+        unique_constraints: 0,
+      });
+      const [afterDown] = await insertAsApp();
+      expect(afterDown?.sequence_number).not.toBeNull();
+
+      await orm.migrator.up();
+      expect(await outboxInsertPrivileges()).toEqual(narrowed);
+      const [afterUp] = await insertAsApp();
+      expect(BigInt(afterUp?.sequence_number) > BigInt(afterDown?.sequence_number)).toBe(true);
+    } finally {
+      await app.close();
+    }
   });
 
   test('down and up can be repeated', async () => {

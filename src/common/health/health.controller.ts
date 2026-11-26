@@ -1,6 +1,7 @@
 import { GetQueueUrlCommand, SQSClient } from '@aws-sdk/client-sqs';
 import { MikroORM } from '@mikro-orm/postgresql';
 import { Controller, Get, Logger, ServiceUnavailableException } from '@nestjs/common';
+import { Public } from '../auth/auth.guard';
 import { AppConfig } from '../config/env';
 
 type DependencyStatus = 'up' | 'down';
@@ -10,6 +11,7 @@ export interface ReadinessReport {
   checks: { postgres: DependencyStatus; sqs: DependencyStatus };
 }
 
+@Public()
 @Controller('health')
 export class HealthController {
   private readonly logger = new Logger(HealthController.name);

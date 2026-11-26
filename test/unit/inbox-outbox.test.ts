@@ -4,7 +4,11 @@ import { canonicalHash } from '../../src/common/hashing/canonical-hash';
 import { newId } from '../../src/common/ids';
 import { InboxMessage } from '../../src/common/messaging/inbox-message';
 import { IntegrationEvent, type IntegrationEventProps } from '../../src/common/messaging/integration-event';
-import { OutboxMessage } from '../../src/common/messaging/outbox-message';
+import {
+  OUTBOX_MAX_AUTO_ATTEMPTS,
+  OUTBOX_QUARANTINED_UNTIL_MS,
+  OutboxMessage,
+} from '../../src/common/messaging/outbox-message';
 
 const t0 = new Date('2026-01-01T00:00:00.000Z');
 const t1 = new Date('2026-01-01T00:00:10.000Z');
@@ -110,17 +114,58 @@ describe('OutboxMessage', () => {
     expect(message.isDue(t0)).toBe(true);
   });
 
-  test('retries back off exponentially up to five minutes', () => {
+  test('retries back off exponentially until the automatic attempts run out', () => {
     const message = OutboxMessage.enqueue(sampleEvent());
     const delays: number[] = [];
-    for (let i = 0; i < 12; i++) {
+    for (let i = 1; i < OUTBOX_MAX_AUTO_ATTEMPTS; i++) {
       message.scheduleRetry(t0);
       delays.push(message.nextAttemptAt!.getTime() - t0.getTime());
     }
 
-    expect(delays.slice(0, 5)).toEqual([1_000, 2_000, 4_000, 8_000, 16_000]);
-    expect(delays.at(-1)).toBe(300_000);
-    expect(message.attempts).toBe(12);
+    expect(delays).toEqual([1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 64_000, 128_000, 256_000]);
+    expect(message.attempts).toBe(OUTBOX_MAX_AUTO_ATTEMPTS - 1);
+    expect(message.isQuarantined()).toBe(false);
+  });
+
+  test('is quarantined at the attempt limit: still pending, never due, attempts kept', () => {
+    const message = OutboxMessage.enqueue(sampleEvent());
+    for (let i = 0; i < OUTBOX_MAX_AUTO_ATTEMPTS; i++) {
+      message.scheduleRetry(t0);
+    }
+
+    expect(message.attempts).toBe(OUTBOX_MAX_AUTO_ATTEMPTS);
+    expect(message.isQuarantined()).toBe(true);
+    expect(message.isPending()).toBe(true);
+    expect(message.nextAttemptAt!.toISOString()).toBe('9999-12-31T23:59:59.999Z');
+    expect(message.isDue(new Date('9999-12-31T23:59:59.998Z'))).toBe(false);
+
+    message.scheduleRetry(t1);
+    expect(message.attempts).toBe(OUTBOX_MAX_AUTO_ATTEMPTS + 1);
+    expect(message.isQuarantined()).toBe(true);
+  });
+
+  test('a requeued message is due again and returns to quarantine on its next failure', () => {
+    const quarantined = OutboxMessage.enqueue(sampleEvent());
+    for (let i = 0; i < OUTBOX_MAX_AUTO_ATTEMPTS; i++) {
+      quarantined.scheduleRetry(t0);
+    }
+    const requeued = OutboxMessage.rehydrate({ ...quarantined.toState(), nextAttemptAt: t1 });
+
+    expect(requeued.isQuarantined()).toBe(false);
+    expect(requeued.isDue(t1)).toBe(true);
+    requeued.scheduleRetry(t1);
+    expect(requeued.isQuarantined()).toBe(true);
+    expect(requeued.attempts).toBe(OUTBOX_MAX_AUTO_ATTEMPTS + 1);
+  });
+
+  test('a published message is not quarantined', () => {
+    const message = OutboxMessage.rehydrate({
+      ...OutboxMessage.enqueue(sampleEvent()).toState(),
+      attempts: OUTBOX_MAX_AUTO_ATTEMPTS,
+      nextAttemptAt: new Date(OUTBOX_QUARANTINED_UNTIL_MS),
+      publishedAt: t1,
+    });
+    expect(message.isQuarantined()).toBe(false);
   });
 
   test('is not due before the scheduled retry', () => {

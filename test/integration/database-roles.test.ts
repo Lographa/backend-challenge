@@ -143,6 +143,7 @@ describe('role catalog', () => {
       select t.name,
              has_table_privilege(t.name, 'SELECT') as select,
              has_table_privilege(t.name, 'INSERT') as insert,
+             has_any_column_privilege(t.name, 'INSERT') as insert_some_columns,
              has_table_privilege(t.name, 'UPDATE') as update,
              has_any_column_privilege(t.name, 'UPDATE') as update_some_columns,
              has_table_privilege(t.name, 'DELETE') as delete,
@@ -150,9 +151,10 @@ describe('role catalog', () => {
              has_table_privilege(t.name, 'TRIGGER') as trigger,
              has_table_privilege(t.name, 'REFERENCES') as references
       from unnest(string_to_array(${FINANCIAL_TABLES.join(',')}, ',')) as t(name) order by t.name`;
-    const row = (update: boolean) => ({
+    const row = (update: boolean, insertEveryColumn = true) => ({
       select: true,
-      insert: true,
+      insert: insertEveryColumn,
+      insert_some_columns: true,
       update: false,
       update_some_columns: update,
       delete: false,
@@ -162,7 +164,8 @@ describe('role catalog', () => {
     });
     expect(privileges).toEqual([
       { name: 'inbox_messages', ...row(true) },
-      { name: 'outbox_messages', ...row(true) },
+      // INSERT on every column except sequence_number, which only PostgreSQL assigns.
+      { name: 'outbox_messages', ...row(true, false) },
       { name: 'wager_transactions', ...row(true) },
       { name: 'wallet_ledger_entries', ...row(false) },
       { name: 'wallets', ...row(true) },

@@ -17,7 +17,7 @@ application user inherits them and nothing else. Neither owns any object.
 | `wallets` | `SELECT`, `INSERT`, `UPDATE (balance_amount, version, updated_at)` |
 | `wager_transactions` | `SELECT`, `INSERT`, `UPDATE (reference_transaction_id, status, failure_code, observed_balance_amount, attempt_count, next_attempt_at, processed_at)` |
 | `inbox_messages` | `SELECT`, `INSERT`, `UPDATE (processed_at)` |
-| `outbox_messages` | `SELECT`, `INSERT`, `UPDATE (attempts, next_attempt_at, published_at)` |
+| `outbox_messages` | `SELECT`, `INSERT` on every column except `sequence_number`, `UPDATE (attempts, next_attempt_at, published_at)` |
 | `mikro_orm_migrations` | none |
 
 Apart from the owner (and the superuser), no role has `DELETE`, `TRUNCATE`, `TRIGGER` or `REFERENCES` on these tables. `PUBLIC` has no
@@ -25,7 +25,8 @@ privileges on the database (no `CONNECT`, no `TEMP`), the schema (no `USAGE`, no
 trigger functions. The trigger functions are `SECURITY INVOKER` with `search_path = public, pg_temp`.
 
 Table grants live in the `ApplicationPrivileges` migration, so new tables need their grants added in the
-migration that creates them. The migration user never grants `EXECUTE` on new functions to `PUBLIC`
+migration that creates them. `OutboxSequenceIntegrity` narrows the outbox `INSERT` so that only PostgreSQL
+assigns `sequence_number`. The migration user never grants `EXECUTE` on new functions to `PUBLIC`
 (default privileges).
 
 The migration user, as owner, can still `ALTER TABLE ... DISABLE TRIGGER`. Only migrations should use it,

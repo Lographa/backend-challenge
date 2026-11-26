@@ -7,6 +7,13 @@ export interface IntegrationEventProps<T> {
   data: T;
 }
 
+/** Request-scoped part of an event; factories generate the eventId and derive the rest. */
+export interface EventContext {
+  correlationId: string;
+  causationId?: string;
+  occurredAt: Date;
+}
+
 export interface IntegrationEventEnvelope<T> {
   eventId: string;
   eventType: string;
