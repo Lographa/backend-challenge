@@ -385,11 +385,11 @@ export class WagerTransaction {
     if (!ALLOWED_REFERENCE_KINDS[this.kind].includes(reference.kind)) {
       return FailureCode.ReferenceKindNotAllowed;
     }
-    if (reference.status !== WagerTransactionStatus.Processed) {
-      return FailureCode.ReferenceNotProcessed;
-    }
     if (this.requiresReference() && !reference.money.equals(this.money)) {
       return FailureCode.AmountMismatch;
+    }
+    if (reference.status !== WagerTransactionStatus.Processed) {
+      return FailureCode.ReferenceNotProcessed;
     }
     return undefined;
   }

@@ -23,6 +23,13 @@ export class AppConfig {
     readonly integrationEventsQueue: string,
     readonly healthCheckTimeoutMs: number,
     readonly shutdownTimeoutMs: number,
+    readonly workersEnabled: boolean,
+    readonly sqsWaitTimeSeconds: number,
+    readonly sqsCallTimeoutMs: number,
+    readonly outboxPollIntervalMs: number,
+    readonly pendingReferencePollIntervalMs: number,
+    readonly pendingReferenceTtlMs: number,
+    readonly pendingReferenceMaxAttempts: number,
   ) {}
 
   static load(source: Record<string, string | undefined>): AppConfig {
@@ -41,6 +48,13 @@ export class AppConfig {
       read.fifoQueueName('SQS_INTEGRATION_EVENTS_QUEUE', 'wager-integration-events.fifo'),
       read.integer('HEALTH_CHECK_TIMEOUT_MS', { default: 2000, min: 100, max: 30000 }),
       read.integer('SHUTDOWN_TIMEOUT_MS', { default: 10000, min: 1000, max: 120000 }),
+      read.boolean('WORKERS_ENABLED', source.NODE_ENV?.trim() !== 'test'),
+      read.integer('SQS_WAIT_TIME_SECONDS', { default: 10, min: 0, max: 20 }),
+      read.integer('SQS_CALL_TIMEOUT_MS', { default: 5000, min: 100, max: 60000 }),
+      read.integer('OUTBOX_POLL_INTERVAL_MS', { default: 200, min: 10, max: 60000 }),
+      read.integer('PENDING_REFERENCE_POLL_INTERVAL_MS', { default: 250, min: 10, max: 60000 }),
+      read.integer('PENDING_REFERENCE_TTL_MS', { default: 60000, min: 100, max: 86400000 }),
+      read.integer('PENDING_REFERENCE_MAX_ATTEMPTS', { default: 10, min: 1, max: 100 }),
     );
 
     if (issues.length > 0) {
@@ -116,6 +130,21 @@ class EnvReader {
       this.issues.push(`${name} must be a valid FIFO queue name ending in .fifo`);
     }
     return value;
+  }
+
+  boolean(name: string, fallback: boolean): boolean {
+    const value = this.raw(name)?.toLowerCase();
+    if (value === undefined) {
+      return fallback;
+    }
+    if (value === 'true') {
+      return true;
+    }
+    if (value === 'false') {
+      return false;
+    }
+    this.issues.push(`${name} must be true or false`);
+    return fallback;
   }
 
   private checkUrl(name: string, value: string, protocols: string[]): void {

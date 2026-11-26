@@ -1,6 +1,7 @@
-import { LockMode, UniqueConstraintViolationException } from '@mikro-orm/core';
+import { IsolationLevel, LockMode, UniqueConstraintViolationException } from '@mikro-orm/core';
 import { type EntityManager, MikroORM } from '@mikro-orm/postgresql';
-import { Injectable } from '@nestjs/common';
+import { Injectable, Optional } from '@nestjs/common';
+import { AppConfig } from '../common/config/env';
 import { DomainError, InvalidStateError } from '../common/errors/domain.error';
 import { FailureCode } from '../common/errors/failure-code';
 import { isUuid, newId } from '../common/ids';
@@ -19,6 +20,7 @@ import { nextPendingReferenceAttemptAt, type ParsedWagerInput } from './wager-pa
 import {
   WagerTransaction,
   WagerTransactionKind,
+  type WagerTransactionState,
   WagerTransactionStatus,
 } from './wager-transaction';
 
@@ -27,6 +29,8 @@ const PROVIDER_EXTERNAL_CONSTRAINT = 'wager_transactions_provider_external_uq';
 const SINGLE_ACTIVE_REVERSAL_CONSTRAINT = 'wager_transactions_single_active_reversal_uq';
 const MAX_PROVIDER_ID_LENGTH = 100;
 const MAX_EXTERNAL_ID_LENGTH = 200;
+const DEFAULT_PENDING_REFERENCE_TTL_MS = 60_000;
+const DEFAULT_PENDING_REFERENCE_MAX_ATTEMPTS = 10;
 
 export interface SubmitWagerCommand extends ParsedWagerInput {
   correlationId: string;
@@ -36,6 +40,33 @@ export interface SubmitWagerCommand extends ParsedWagerInput {
 export interface ProcessWagerResult {
   transaction: WagerTransaction;
   idempotentReplay: boolean;
+}
+
+export interface PendingReferencePolicy {
+  readonly ttlMs: number;
+  readonly maxAttempts: number;
+}
+
+export type ResolvePendingReferenceResult =
+  | { readonly outcome: 'skipped' }
+  | { readonly outcome: 'rescheduled'; readonly transaction: WagerTransaction }
+  | { readonly outcome: 'resolved'; readonly transaction: WagerTransaction };
+
+type EventContextProvider = () => EventContext | Promise<EventContext>;
+
+/**
+ * Private internal sentinel (never exported, never an instance of `DomainError`) thrown inside the
+ * resolution SAVEPOINT when a concurrent transaction committed between the lock-free prefetch probe
+ * and `wallets FOR UPDATE`, turning a predicted `rescheduled` pass into a terminal resolution while
+ * `cachedCtx` is still empty. Catching this rolls back the SAVEPOINT (releasing `wallets FOR UPDATE`
+ * and `wager_transactions FOR UPDATE` in PostgreSQL) so `findOriginatingEventContext` executes
+ * completely outside pessimistic row locks before a single bounded re-run.
+ */
+class OriginatingContextPrefetchRequiredSignal extends Error {
+  constructor() {
+    super('Originating event context prefetch required outside wallet lock');
+    this.name = 'OriginatingContextPrefetchRequiredSignal';
+  }
 }
 
 interface DecidedWrite {
@@ -50,13 +81,19 @@ interface DecidedWrite {
 
 @Injectable()
 export class WagerProcessorService {
-  constructor(private readonly orm: MikroORM) {}
+  constructor(
+    private readonly orm: MikroORM,
+    @Optional() private readonly config?: AppConfig,
+  ) {}
 
   /** Entry point when the caller does not already own a SQL transaction (HTTP). */
   async process(command: SubmitWagerCommand): Promise<ProcessWagerResult> {
     // Validate domain invariants before checking out a pooled connection.
     buildCandidate(command, new Date());
-    return this.orm.em.fork().transactional((txEm) => this.processInTransaction(txEm, command));
+    return this.orm.em.fork().transactional(
+      (txEm) => this.processInTransaction(txEm, command),
+      { isolationLevel: IsolationLevel.READ_COMMITTED },
+    );
   }
 
   /**
@@ -106,8 +143,68 @@ export class WagerProcessorService {
       );
     }
 
-    const decided = await this.decide(txEm, wallet, candidate, ctx, now);
+    const decided = await this.decide(txEm, wallet, candidate, () => ctx, now, this.defaultPendingPolicy());
     return this.persistWithSavepoint(txEm, command, walletRecord, decided, ctx, now);
+  }
+
+  /**
+   * Re-evaluates a persisted PENDING_REFERENCE transaction inside the caller's READ COMMITTED
+   * SQL transaction while strictly preserving the global lock order:
+   * wallets FOR UPDATE -> wager_transactions FOR UPDATE -> ledger -> outbox.
+   */
+  async resolvePendingReferenceInTransaction(
+    txEm: EntityManager,
+    transactionId: string,
+    walletId: string,
+    options?: { now?: Date; policy?: PendingReferencePolicy },
+  ): Promise<ResolvePendingReferenceResult> {
+    if (!txEm.isInTransaction()) {
+      throw new InvalidStateError(
+        'WagerProcessorService.resolvePendingReferenceInTransaction requires an active transaction',
+      );
+    }
+    if (!isUuid(transactionId) || !isUuid(walletId)) {
+      throw new DomainError(FailureCode.InvalidPayload, 'transactionId and walletId must be UUIDs');
+    }
+
+    const now = options?.now ?? new Date();
+    const policy = options?.policy ?? this.defaultPendingPolicy();
+    let cachedCtx: EventContext | undefined;
+
+    // Lock-free PK + unique-index MVCC check inside txEm BEFORE acquiring `wallets FOR UPDATE`:
+    // - Takes zero row locks, preserving `wallets FOR UPDATE -> wager_transactions FOR UPDATE -> ledger -> outbox`.
+    // - Rehydrates domain entities to evaluate `referenceViolation` without duplicating domain rules in SQL.
+    // - Skips `outbox_messages` completely on `skipped` and `rescheduled` paths.
+    if (await shouldPrefetchOriginatingContext(txEm, transactionId, walletId, now, policy)) {
+      cachedCtx = await findOriginatingEventContext(txEm, walletId, transactionId, now);
+    }
+
+    try {
+      return await this.executePendingResolutionSavepoint(
+        txEm,
+        transactionId,
+        walletId,
+        now,
+        policy,
+        cachedCtx,
+      );
+    } catch (error) {
+      if (!(error instanceof OriginatingContextPrefetchRequiredSignal)) {
+        throw error;
+      }
+    }
+
+    // SAVEPOINT rolled back, releasing `wallets FOR UPDATE` and `wager_transactions FOR UPDATE`.
+    // Load the originating context with zero pessimistic row locks held, then re-run at most once.
+    cachedCtx = await findOriginatingEventContext(txEm, walletId, transactionId, now);
+    return this.executePendingResolutionSavepoint(
+      txEm,
+      transactionId,
+      walletId,
+      now,
+      policy,
+      cachedCtx,
+    );
   }
 
   async getById(transactionId: string): Promise<WagerTransaction> {
@@ -137,13 +234,87 @@ export class WagerProcessorService {
     return WagerTransaction.rehydrate(record);
   }
 
+  private defaultPendingPolicy(): PendingReferencePolicy {
+    return {
+      ttlMs: this.config?.pendingReferenceTtlMs ?? DEFAULT_PENDING_REFERENCE_TTL_MS,
+      maxAttempts: this.config?.pendingReferenceMaxAttempts ?? DEFAULT_PENDING_REFERENCE_MAX_ATTEMPTS,
+    };
+  }
+
+  /**
+   * Runs one locked resolution attempt inside a SAVEPOINT (`txEm.transactional` with `clear: true`).
+   * `findOriginatingEventContext` is structurally unreachable here: if a concurrent commit made a
+   * terminal event necessary while `prefetchedCtx` is `undefined`, `resolveCtx` throws
+   * `OriginatingContextPrefetchRequiredSignal` so PostgreSQL rolls back to the SAVEPOINT and
+   * releases all row locks before `findOriginatingEventContext` is queried.
+   */
+  private async executePendingResolutionSavepoint(
+    txEm: EntityManager,
+    transactionId: string,
+    walletId: string,
+    now: Date,
+    policy: PendingReferencePolicy,
+    prefetchedCtx: EventContext | undefined,
+  ): Promise<ResolvePendingReferenceResult> {
+    return txEm.transactional(
+      async (attemptEm) => {
+        const walletRecord = await attemptEm.findOne(WalletRecord, walletId, {
+          lockMode: LockMode.PESSIMISTIC_WRITE,
+          refresh: true,
+        });
+        if (walletRecord === null) {
+          throw new DomainError(FailureCode.WalletNotFound, `Wallet ${walletId} does not exist`);
+        }
+
+        const txRecord = await attemptEm.findOne(WagerTransactionRecord, transactionId, {
+          lockMode: LockMode.PESSIMISTIC_WRITE,
+          refresh: true,
+        });
+        if (txRecord === null || txRecord.status !== WagerTransactionStatus.PendingReference) {
+          attemptEm.clear();
+          return { outcome: 'skipped' };
+        }
+        if (txRecord.walletId !== walletId) {
+          throw new InvalidStateError(
+            `Pending transaction ${transactionId} belongs to wallet ${txRecord.walletId}, not ${walletId}`,
+          );
+        }
+        if (txRecord.nextAttemptAt === null || txRecord.nextAttemptAt > now) {
+          attemptEm.clear();
+          return { outcome: 'skipped' };
+        }
+
+        const wallet = Wallet.rehydrate(walletRecord);
+        const candidate = WagerTransaction.rehydrate(txRecord);
+        const resolveCtx: EventContextProvider = () => {
+          if (prefetchedCtx === undefined) {
+            throw new OriginatingContextPrefetchRequiredSignal();
+          }
+          return prefetchedCtx;
+        };
+
+        const decided = await this.decide(attemptEm, wallet, candidate, resolveCtx, now, policy);
+        await applyPendingResolutionWrite(attemptEm, decided);
+        // Clear pre-nativeUpdate entities so `mergeEntitiesToParent` cannot copy stale snapshots into `txEm`.
+        attemptEm.clear();
+
+        return decided.transaction.status === WagerTransactionStatus.PendingReference
+          ? { outcome: 'rescheduled', transaction: decided.transaction }
+          : { outcome: 'resolved', transaction: decided.transaction };
+      },
+      { clear: true },
+    );
+  }
+
   private async decide(
     txEm: EntityManager,
     wallet: Wallet,
     candidate: WagerTransaction,
-    ctx: EventContext,
+    resolveCtx: EventContextProvider,
     now: Date,
+    policy: PendingReferencePolicy,
   ): Promise<DecidedWrite> {
+    const wasAlreadyPendingReference = candidate.status === WagerTransactionStatus.PendingReference;
     let resolvedReference: WagerTransaction | undefined;
 
     if (candidate.referenceExternalTransactionId !== undefined) {
@@ -158,22 +329,40 @@ export class WagerProcessorService {
 
       if (refRecord === null) {
         if (candidate.requiresReference() && (await hasActiveReversal(txEm, candidate))) {
-          return rejectCandidate(candidate, FailureCode.ReferenceAlreadyReversed, wallet, ctx);
+          return rejectCandidate(candidate, FailureCode.ReferenceAlreadyReversed, wallet, await resolveCtx());
         }
-        candidate.markPendingReference(nextPendingReferenceAttemptAt(now, candidate.attemptCount + 1));
-        return {
-          transaction: candidate,
-          events: [WagerTransactionPendingReference.from(candidate, ctx)],
-        };
+        return parkOrExpirePendingReference(
+          candidate,
+          wallet,
+          resolveCtx,
+          now,
+          wasAlreadyPendingReference,
+          FailureCode.ReferenceNotFound,
+          policy,
+        );
       }
 
       const reference = WagerTransaction.rehydrate(refRecord);
       const violation = candidate.referenceViolation(reference);
       if (violation !== undefined) {
-        return rejectCandidate(candidate, violation, wallet, ctx);
+        if (violation === FailureCode.ReferenceNotProcessed && !reference.isTerminal()) {
+          if (candidate.requiresReference() && (await hasActiveReversal(txEm, candidate))) {
+            return rejectCandidate(candidate, FailureCode.ReferenceAlreadyReversed, wallet, await resolveCtx());
+          }
+          return parkOrExpirePendingReference(
+            candidate,
+            wallet,
+            resolveCtx,
+            now,
+            wasAlreadyPendingReference,
+            FailureCode.ReferenceNotProcessed,
+            policy,
+          );
+        }
+        return rejectCandidate(candidate, violation, wallet, await resolveCtx());
       }
       if (candidate.requiresReference() && (await hasActiveReversal(txEm, candidate))) {
-        return rejectCandidate(candidate, FailureCode.ReferenceAlreadyReversed, wallet, ctx);
+        return rejectCandidate(candidate, FailureCode.ReferenceAlreadyReversed, wallet, await resolveCtx());
       }
       resolvedReference = reference;
     }
@@ -182,7 +371,7 @@ export class WagerProcessorService {
       candidate.markProcessed(resolvedReference?.id, wallet.balance, now);
       return {
         transaction: candidate,
-        events: [WagerTransactionProcessed.from(candidate, ctx)],
+        events: [WagerTransactionProcessed.from(candidate, await resolveCtx())],
       };
     }
 
@@ -194,7 +383,7 @@ export class WagerProcessorService {
         candidate.kind === WagerTransactionKind.Rollback
           ? FailureCode.NegativeBalanceReversal
           : FailureCode.InsufficientFunds;
-      return rejectCandidate(candidate, code, wallet, ctx);
+      return rejectCandidate(candidate, code, wallet, await resolveCtx());
     }
 
     let entry: WalletLedgerEntry;
@@ -205,11 +394,12 @@ export class WagerProcessorService {
           : wallet.debit(candidate.money, candidate.id, now);
     } catch (error) {
       if (error instanceof DomainError && error.code === FailureCode.AmountOutOfRange) {
-        return rejectCandidate(candidate, FailureCode.AmountOutOfRange, wallet, ctx);
+        return rejectCandidate(candidate, FailureCode.AmountOutOfRange, wallet, await resolveCtx());
       }
       throw error;
     }
     candidate.markProcessed(resolvedReference?.id, wallet.balance, now);
+    const ctx = await resolveCtx();
 
     return {
       transaction: candidate,
@@ -281,26 +471,349 @@ async function executeDecidedWrite(txEm: EntityManager, decided: DecidedWrite): 
   await txEm.transactional(
     async (innerEm) => {
       await innerEm.insert(WagerTransactionRecord, decided.transaction.toState());
-      if (decided.walletMovement !== undefined) {
-        const { previousVersion, wallet, entry } = decided.walletMovement;
-        const state = wallet.toState();
-        const updated = await innerEm.nativeUpdate(
-          WalletRecord,
-          { id: wallet.id, version: previousVersion },
-          { balanceAmount: state.balanceAmount, version: state.version, updatedAt: state.updatedAt },
-        );
-        if (updated !== 1) {
-          throw new DomainError(
-            FailureCode.PermanentIntegrityError,
-            `Failed to update locked wallet ${wallet.id} at version ${previousVersion}`,
-          );
-        }
-        await innerEm.insert(WalletLedgerEntryRecord, entry.toState());
-      }
-      await enqueueEvents(innerEm, decided.events);
+      await applyWalletAndEvents(innerEm, decided);
     },
     { clear: true },
   );
+}
+
+async function applyPendingResolutionWrite(attemptEm: EntityManager, decided: DecidedWrite): Promise<void> {
+  const txState = decided.transaction.toState();
+  const updatedTx = await attemptEm.nativeUpdate(
+    WagerTransactionRecord,
+    { id: txState.id, status: WagerTransactionStatus.PendingReference },
+    {
+      referenceTransactionId: txState.referenceTransactionId,
+      status: txState.status,
+      failureCode: txState.failureCode,
+      observedBalanceAmount: txState.observedBalanceAmount,
+      attemptCount: txState.attemptCount,
+      nextAttemptAt: txState.nextAttemptAt,
+      processedAt: txState.processedAt,
+    },
+  );
+  if (updatedTx !== 1) {
+    throw new DomainError(
+      FailureCode.PermanentIntegrityError,
+      `Failed to update pending transaction ${txState.id}`,
+    );
+  }
+  await applyWalletAndEvents(attemptEm, decided);
+}
+
+async function applyWalletAndEvents(innerEm: EntityManager, decided: DecidedWrite): Promise<void> {
+  if (decided.walletMovement !== undefined) {
+    const { previousVersion, wallet, entry } = decided.walletMovement;
+    const state = wallet.toState();
+    const updated = await innerEm.nativeUpdate(
+      WalletRecord,
+      { id: wallet.id, version: previousVersion },
+      { balanceAmount: state.balanceAmount, version: state.version, updatedAt: state.updatedAt },
+    );
+    if (updated !== 1) {
+      throw new DomainError(
+        FailureCode.PermanentIntegrityError,
+        `Failed to update locked wallet ${wallet.id} at version ${previousVersion}`,
+      );
+    }
+    await innerEm.insert(WalletLedgerEntryRecord, entry.toState());
+  }
+  if (decided.events.length > 0) {
+    await enqueueEvents(innerEm, decided.events);
+  }
+}
+
+async function parkOrExpirePendingReference(
+  candidate: WagerTransaction,
+  wallet: Wallet,
+  resolveCtx: EventContextProvider,
+  now: Date,
+  wasAlreadyPendingReference: boolean,
+  expirationCode: FailureCode,
+  policy: PendingReferencePolicy,
+): Promise<DecidedWrite> {
+  if (!wasAlreadyPendingReference) {
+    candidate.markPendingReference(nextPendingReferenceAttemptAt(now, candidate.attemptCount + 1));
+    return {
+      transaction: candidate,
+      events: [WagerTransactionPendingReference.from(candidate, await resolveCtx())],
+    };
+  }
+
+  const ageMs = now.getTime() - candidate.createdAt.getTime();
+  if (candidate.attemptCount >= policy.maxAttempts || ageMs >= policy.ttlMs) {
+    return rejectCandidate(candidate, expirationCode, wallet, await resolveCtx());
+  }
+
+  candidate.markPendingReference(nextPendingReferenceAttemptAt(now, candidate.attemptCount + 1));
+  return {
+    transaction: candidate,
+    events: [],
+  };
+}
+
+interface PendingPrefetchJoinRow {
+  t_id: string;
+  t_provider_id: string;
+  t_external_transaction_id: string;
+  t_idempotency_key: string;
+  t_payload_hash: string;
+  t_wallet_id: string;
+  t_player_id: string;
+  t_round_id: string;
+  t_game_id: string;
+  t_kind: WagerTransactionKind;
+  t_amount: string;
+  t_currency: string;
+  t_reference_external_transaction_id: string | null;
+  t_reference_transaction_id: string | null;
+  t_status: WagerTransactionStatus;
+  t_failure_code: FailureCode | null;
+  t_observed_balance_amount: string | null;
+  t_attempt_count: number | string;
+  t_next_attempt_at: Date | string | null;
+  t_processed_at: Date | string | null;
+  t_created_at: Date | string;
+  r_id: string | null;
+  r_provider_id: string | null;
+  r_external_transaction_id: string | null;
+  r_idempotency_key: string | null;
+  r_payload_hash: string | null;
+  r_wallet_id: string | null;
+  r_player_id: string | null;
+  r_round_id: string | null;
+  r_game_id: string | null;
+  r_kind: WagerTransactionKind | null;
+  r_amount: string | null;
+  r_currency: string | null;
+  r_reference_external_transaction_id: string | null;
+  r_reference_transaction_id: string | null;
+  r_status: WagerTransactionStatus | null;
+  r_failure_code: FailureCode | null;
+  r_observed_balance_amount: string | null;
+  r_attempt_count: number | string | null;
+  r_next_attempt_at: Date | string | null;
+  r_processed_at: Date | string | null;
+  r_created_at: Date | string | null;
+  has_active_reversal: boolean;
+}
+
+/**
+ * Single O(1) PK + unique-index MVCC probe inside `txEm` (zero row locks) that rehydrates
+ * `WagerTransaction` domain entities and delegates to `candidate.referenceViolation(reference)`
+ * so zero domain rules are duplicated in SQL. Returns `true` whenever the visible snapshot will
+ * produce a terminal event (`PROCESSED` or `REJECTED`), and `false` on `skipped` / `rescheduled`.
+ */
+async function shouldPrefetchOriginatingContext(
+  txEm: EntityManager,
+  transactionId: string,
+  walletId: string,
+  now: Date,
+  policy: PendingReferencePolicy,
+): Promise<boolean> {
+  const rows = await txEm.execute<PendingPrefetchJoinRow[]>(
+    `select
+        t.id as t_id,
+        t.provider_id as t_provider_id,
+        t.external_transaction_id as t_external_transaction_id,
+        t.idempotency_key as t_idempotency_key,
+        t.payload_hash as t_payload_hash,
+        t.wallet_id as t_wallet_id,
+        t.player_id as t_player_id,
+        t.round_id as t_round_id,
+        t.game_id as t_game_id,
+        t.kind as t_kind,
+        t.amount as t_amount,
+        t.currency as t_currency,
+        t.reference_external_transaction_id as t_reference_external_transaction_id,
+        t.reference_transaction_id as t_reference_transaction_id,
+        t.status as t_status,
+        t.failure_code as t_failure_code,
+        t.observed_balance_amount as t_observed_balance_amount,
+        t.attempt_count as t_attempt_count,
+        t.next_attempt_at as t_next_attempt_at,
+        t.processed_at as t_processed_at,
+        t.created_at as t_created_at,
+        r.id as r_id,
+        r.provider_id as r_provider_id,
+        r.external_transaction_id as r_external_transaction_id,
+        r.idempotency_key as r_idempotency_key,
+        r.payload_hash as r_payload_hash,
+        r.wallet_id as r_wallet_id,
+        r.player_id as r_player_id,
+        r.round_id as r_round_id,
+        r.game_id as r_game_id,
+        r.kind as r_kind,
+        r.amount as r_amount,
+        r.currency as r_currency,
+        r.reference_external_transaction_id as r_reference_external_transaction_id,
+        r.reference_transaction_id as r_reference_transaction_id,
+        r.status as r_status,
+        r.failure_code as r_failure_code,
+        r.observed_balance_amount as r_observed_balance_amount,
+        r.attempt_count as r_attempt_count,
+        r.next_attempt_at as r_next_attempt_at,
+        r.processed_at as r_processed_at,
+        r.created_at as r_created_at,
+        case
+          when t.status = 'PENDING_REFERENCE' and t.kind in ('REFUND', 'ROLLBACK') then exists (
+            select 1
+            from wager_transactions rev
+            where rev.provider_id = t.provider_id
+              and rev.reference_external_transaction_id = t.reference_external_transaction_id
+              and rev.id <> t.id
+              and rev.kind in ('REFUND', 'ROLLBACK')
+              and rev.status in ('PENDING_REFERENCE', 'PROCESSED')
+          )
+          else false
+        end as has_active_reversal
+     from wager_transactions t
+     left join wager_transactions r
+       on t.status = 'PENDING_REFERENCE'
+      and r.provider_id = t.provider_id
+      and r.external_transaction_id = t.reference_external_transaction_id
+     where t.id = ?
+       and t.wallet_id = ?`,
+    [transactionId, walletId],
+  );
+
+  const probe = rows[0];
+  if (
+    probe === undefined ||
+    probe.t_status !== WagerTransactionStatus.PendingReference ||
+    probe.t_next_attempt_at === null
+  ) {
+    return false;
+  }
+
+  const candidate = WagerTransaction.rehydrate(extractPrefetchTransactionState(probe, 't'));
+  if (candidate.nextAttemptAt === undefined || candidate.nextAttemptAt > now) {
+    return false;
+  }
+
+  const ageMs = now.getTime() - candidate.createdAt.getTime();
+  if (candidate.attemptCount >= policy.maxAttempts || ageMs >= policy.ttlMs) {
+    return true;
+  }
+
+  if (candidate.requiresReference() && Boolean(probe.has_active_reversal)) {
+    return true;
+  }
+
+  if (probe.r_id === null) {
+    return false;
+  }
+
+  const reference = WagerTransaction.rehydrate(extractPrefetchTransactionState(probe, 'r'));
+  const violation = candidate.referenceViolation(reference);
+  return !(violation === FailureCode.ReferenceNotProcessed && !reference.isTerminal());
+}
+
+function extractPrefetchTransactionState(
+  row: PendingPrefetchJoinRow,
+  prefix: 't' | 'r',
+): WagerTransactionState {
+  if (prefix === 't') {
+    return {
+      id: row.t_id,
+      providerId: row.t_provider_id,
+      externalTransactionId: row.t_external_transaction_id,
+      idempotencyKey: row.t_idempotency_key,
+      payloadHash: row.t_payload_hash,
+      walletId: row.t_wallet_id,
+      playerId: row.t_player_id,
+      roundId: row.t_round_id,
+      gameId: row.t_game_id,
+      kind: row.t_kind,
+      amount: assertDecimalColumnString('t_amount', row.t_amount),
+      currency: row.t_currency,
+      referenceExternalTransactionId: row.t_reference_external_transaction_id,
+      referenceTransactionId: row.t_reference_transaction_id,
+      status: row.t_status,
+      failureCode: row.t_failure_code,
+      observedBalanceAmount:
+        row.t_observed_balance_amount === null
+          ? null
+          : assertDecimalColumnString('t_observed_balance_amount', row.t_observed_balance_amount),
+      attemptCount: Number(row.t_attempt_count),
+      nextAttemptAt: toOptionalDate(row.t_next_attempt_at),
+      processedAt: toOptionalDate(row.t_processed_at),
+      createdAt: toRequiredDate(row.t_created_at),
+    };
+  }
+
+  return {
+    id: row.r_id!,
+    providerId: row.r_provider_id!,
+    externalTransactionId: row.r_external_transaction_id!,
+    idempotencyKey: row.r_idempotency_key!,
+    payloadHash: row.r_payload_hash!,
+    walletId: row.r_wallet_id!,
+    playerId: row.r_player_id!,
+    roundId: row.r_round_id!,
+    gameId: row.r_game_id!,
+    kind: row.r_kind!,
+    amount: assertDecimalColumnString('r_amount', row.r_amount),
+    currency: row.r_currency!,
+    referenceExternalTransactionId: row.r_reference_external_transaction_id,
+    referenceTransactionId: row.r_reference_transaction_id,
+    status: row.r_status!,
+    failureCode: row.r_failure_code,
+    observedBalanceAmount:
+      row.r_observed_balance_amount === null
+        ? null
+        : assertDecimalColumnString('r_observed_balance_amount', row.r_observed_balance_amount),
+    attemptCount: Number(row.r_attempt_count),
+    nextAttemptAt: toOptionalDate(row.r_next_attempt_at),
+    processedAt: toOptionalDate(row.r_processed_at),
+    createdAt: toRequiredDate(row.r_created_at!),
+  };
+}
+
+function assertDecimalColumnString(column: string, value: unknown): string {
+  if (typeof value !== 'string') {
+    throw new InvalidStateError(`Expected decimal string for ${column}, received ${typeof value}`);
+  }
+  return value;
+}
+
+function toRequiredDate(value: Date | string): Date {
+  return value instanceof Date ? value : new Date(value);
+}
+
+function toOptionalDate(value: Date | string | null): Date | null {
+  if (value === null) {
+    return null;
+  }
+  return value instanceof Date ? value : new Date(value);
+}
+
+async function findOriginatingEventContext(
+  txEm: EntityManager,
+  walletId: string,
+  transactionId: string,
+  occurredAt: Date,
+): Promise<EventContext> {
+  // At most one WagerTransactionPendingReference event is ever emitted per transactionId, so
+  // `limit 1` without `order by occurred_at` short-circuits on the first match without sorting.
+  const rows = await txEm.execute<{ id: string; correlation_id: string | null }[]>(
+    `select id, payload->>'correlationId' as correlation_id
+     from outbox_messages
+     where aggregate_id = ?
+       and event_type = 'WagerTransactionPendingReference'
+       and payload->'data'->>'transactionId' = ?
+     limit 1`,
+    [walletId, transactionId],
+  );
+  const origin = rows[0];
+  if (origin !== undefined && typeof origin.correlation_id === 'string' && origin.correlation_id.length > 0) {
+    return {
+      correlationId: origin.correlation_id,
+      causationId: origin.id,
+      occurredAt,
+    };
+  }
+  return { correlationId: newId(), occurredAt };
 }
 
 function buildCandidate(command: SubmitWagerCommand, now: Date): WagerTransaction {
@@ -375,6 +888,7 @@ async function hasActiveReversal(txEm: EntityManager, candidate: WagerTransactio
   const existing = await txEm.findOne(
     WagerTransactionRecord,
     {
+      id: { $ne: candidate.id },
       providerId: candidate.providerId,
       referenceExternalTransactionId: candidate.referenceExternalTransactionId,
       kind: { $in: [WagerTransactionKind.Refund, WagerTransactionKind.Rollback] },
