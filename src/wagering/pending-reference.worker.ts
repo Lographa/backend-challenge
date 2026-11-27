@@ -1,7 +1,9 @@
 import { IsolationLevel } from '@mikro-orm/core';
 import { MikroORM } from '@mikro-orm/postgresql';
-import { Injectable, Logger, type OnApplicationBootstrap, type OnModuleDestroy } from '@nestjs/common';
+import { Injectable, Logger, type OnApplicationBootstrap, type OnModuleDestroy, Optional } from '@nestjs/common';
 import { AppConfig } from '../common/config/env';
+import { ShutdownService } from '../common/http/shutdown.service';
+import { computeJitteredDelayMs } from '../common/instance/instance-identity';
 import {
   type PendingReferencePolicy,
   type ResolvePendingReferenceResult,
@@ -38,20 +40,26 @@ export class PendingReferenceWorker implements OnApplicationBootstrap, OnModuleD
   private loopPromise: Promise<void> | undefined;
   private wakeWaiter: (() => void) | undefined;
   private activeBatchPromise: Promise<PendingReferenceBatchStats> | undefined;
+  private detachShutdownWake: (() => void) | undefined;
 
   constructor(
     private readonly orm: MikroORM,
     private readonly processor: WagerProcessorService,
     private readonly config: AppConfig,
+    @Optional() private readonly shutdown?: ShutdownService,
   ) {}
 
   onApplicationBootstrap(): void {
-    if (this.config.workersEnabled) {
+    if (this.config.workersEnabled && this.shutdown?.isShuttingDown() !== true) {
       this.start();
     }
   }
 
   async onModuleDestroy(): Promise<void> {
+    if (this.shutdown !== undefined) {
+      await this.shutdown.runWithinCooperativeBudget(PendingReferenceWorker.name, () => this.stop(), ['postgres']);
+      return;
+    }
     await this.stop();
   }
 
@@ -61,12 +69,23 @@ export class PendingReferenceWorker implements OnApplicationBootstrap, OnModuleD
     }
     this.stopping = false;
     this.running = true;
+    if (this.shutdown !== undefined && !this.shutdown.shutdownSignal.aborted) {
+      const onShutdownAbort = (): void => {
+        this.wakeWaiter?.();
+      };
+      this.shutdown.shutdownSignal.addEventListener('abort', onShutdownAbort, { once: true });
+      this.detachShutdownWake = () => {
+        this.shutdown?.shutdownSignal.removeEventListener('abort', onShutdownAbort);
+      };
+    }
     this.loopPromise = this.runLoop();
   }
 
   async stop(): Promise<void> {
     this.stopping = true;
     this.running = false;
+    this.detachShutdownWake?.();
+    this.detachShutdownWake = undefined;
     this.wakeWaiter?.();
     await this.loopPromise;
     this.loopPromise = undefined;
@@ -83,7 +102,17 @@ export class PendingReferenceWorker implements OnApplicationBootstrap, OnModuleD
     if (this.activeBatchPromise !== undefined) {
       return this.activeBatchPromise;
     }
-    const work = this.executeBatch(options);
+    const work =
+      this.shutdown !== undefined
+        ? this.shutdown.trackCriticalOperation(
+            {
+              kind: 'pending_reference',
+              name: 'PendingReferenceWorker.processDueBatch',
+              resources: ['postgres'],
+            },
+            () => this.executeBatch(options),
+          )
+        : this.executeBatch(options);
     this.activeBatchPromise = work;
     try {
       return await work;
@@ -100,16 +129,36 @@ export class PendingReferenceWorker implements OnApplicationBootstrap, OnModuleD
       throw new RangeError('batchSize must be a positive integer');
     }
 
-    const scanTime = options.now ?? new Date();
-    const candidates = await this.orm.em.fork().execute<DuePendingCandidateRow[]>(
-      `select id, wallet_id
-       from wager_transactions
-       where status = ?
-         and next_attempt_at <= ?
-       order by next_attempt_at asc, id asc
-       limit ?`,
-      [WagerTransactionStatus.PendingReference, scanTime, batchSize],
-    );
+    if (this.stopping || this.shutdown?.isShuttingDown() === true) {
+      return {
+        scanned: 0,
+        resolved: 0,
+        rescheduled: 0,
+        skipped: 0,
+        failed: 0,
+      };
+    }
+
+    const candidates =
+      options.now !== undefined
+        ? await this.orm.em.fork().execute<DuePendingCandidateRow[]>(
+            `select id, wallet_id
+             from wager_transactions
+             where status = ?
+               and next_attempt_at <= ?
+             order by next_attempt_at asc, id asc
+             limit ?`,
+            [WagerTransactionStatus.PendingReference, options.now, batchSize],
+          )
+        : await this.orm.em.fork().execute<DuePendingCandidateRow[]>(
+            `select id, wallet_id
+             from wager_transactions
+             where status = ?
+               and next_attempt_at <= clock_timestamp()
+             order by next_attempt_at asc, id asc
+             limit ?`,
+            [WagerTransactionStatus.PendingReference, batchSize],
+          );
 
     let resolved = 0;
     let rescheduled = 0;
@@ -117,7 +166,7 @@ export class PendingReferenceWorker implements OnApplicationBootstrap, OnModuleD
     let failed = 0;
 
     for (const candidate of candidates) {
-      if (this.stopping) {
+      if (this.stopping || this.shutdown?.isShuttingDown() === true) {
         break;
       }
       try {
@@ -165,7 +214,7 @@ export class PendingReferenceWorker implements OnApplicationBootstrap, OnModuleD
   }
 
   private async runLoop(): Promise<void> {
-    while (this.running) {
+    while (this.running && this.shutdown?.isShuttingDown() !== true) {
       let stats: PendingReferenceBatchStats | undefined;
       try {
         stats = await this.processDueBatch({ batchSize: DEFAULT_BATCH_SIZE });
@@ -176,13 +225,13 @@ export class PendingReferenceWorker implements OnApplicationBootstrap, OnModuleD
         });
       }
 
-      if (!this.running) {
+      if (!this.running || this.shutdown?.isShuttingDown() === true) {
         break;
       }
 
       const saturated = stats !== undefined && stats.scanned >= DEFAULT_BATCH_SIZE && stats.failed === 0;
       if (!saturated) {
-        await this.sleep(this.config.pendingReferencePollIntervalMs);
+        await this.sleep(computeJitteredDelayMs(this.config.pendingReferencePollIntervalMs));
       }
     }
   }

@@ -2,6 +2,7 @@ import {
   type BatchResultErrorEntry,
   ChangeMessageVisibilityBatchCommand,
   DeleteMessageCommand,
+  GetQueueAttributesCommand,
   GetQueueUrlCommand,
   type Message,
   ReceiveMessageCommand,
@@ -10,17 +11,22 @@ import {
 } from '@aws-sdk/client-sqs';
 import { IsolationLevel } from '@mikro-orm/core';
 import { type EntityManager, MikroORM } from '@mikro-orm/postgresql';
-import { Injectable, Logger, type OnApplicationBootstrap, type OnModuleDestroy } from '@nestjs/common';
+import { Injectable, Logger, type OnApplicationBootstrap, type OnModuleDestroy, Optional } from '@nestjs/common';
 import { AppConfig } from '../common/config/env';
 import { DomainError } from '../common/errors/domain.error';
 import { FailureCode } from '../common/errors/failure-code';
 import { isTransientInfrastructureError } from '../common/errors/transient-error';
+import { CooperativeBudgetExhaustedError, ShutdownService } from '../common/http/shutdown.service';
+import { computeJitteredDelayMs } from '../common/instance/instance-identity';
 import { InboxMessage } from '../common/messaging/inbox-message';
+import { readDatabaseClock } from '../database/clock';
 import { type ProcessWagerResult, WagerProcessorService } from '../wagering/wager-processor.service';
+import { BatchVisibilityLeaseManager } from './sqs-visibility-lease';
 import { deriveDlqRouting, type ParsedWagerMessage, parseWagerMessage, WAGER_CONSUMER_NAME } from './wager-message';
 
 const DEFAULT_MAX_MESSAGES = 10;
 const MAX_SQS_VISIBILITY_BATCH_SIZE = 10;
+const DEFAULT_VISIBILITY_TIMEOUT_SECONDS = 30;
 const ERROR_BACKOFF_MS = 250;
 
 /**
@@ -85,6 +91,7 @@ export class WagerTransactionsConsumer implements OnApplicationBootstrap, OnModu
   private sleepWake: (() => void) | undefined;
   private activePollPromise: Promise<PollBatchStats> | undefined;
   private mainQueueUrl: string | undefined;
+  private mainQueueVisibilityTimeoutSeconds: number | undefined;
   private dlqUrl: string | undefined;
 
   constructor(
@@ -92,15 +99,23 @@ export class WagerTransactionsConsumer implements OnApplicationBootstrap, OnModu
     private readonly orm: MikroORM,
     private readonly processor: WagerProcessorService,
     private readonly config: AppConfig,
+    @Optional() private readonly shutdown?: ShutdownService,
   ) {}
 
   onApplicationBootstrap(): void {
-    if (this.config.workersEnabled) {
+    if (this.config.workersEnabled && this.shutdown?.isShuttingDown() !== true) {
       this.start();
     }
   }
 
   async onModuleDestroy(): Promise<void> {
+    if (this.shutdown !== undefined) {
+      await this.shutdown.runWithinCooperativeBudget(WagerTransactionsConsumer.name, () => this.stop(), [
+        'postgres',
+        'sqs',
+      ]);
+      return;
+    }
     await this.stop();
   }
 
@@ -127,6 +142,7 @@ export class WagerTransactionsConsumer implements OnApplicationBootstrap, OnModu
   /** Resets cached queue URLs (useful if queues are recreated or reconfigured). */
   clearQueueUrlCache(): void {
     this.mainQueueUrl = undefined;
+    this.mainQueueVisibilityTimeoutSeconds = undefined;
     this.dlqUrl = undefined;
   }
 
@@ -134,7 +150,9 @@ export class WagerTransactionsConsumer implements OnApplicationBootstrap, OnModu
     if (this.activePollPromise !== undefined) {
       return this.activePollPromise;
     }
-    const work = this.executePoll(options);
+    const work = this.trackConsumerOperation('WagerTransactionsConsumer.pollOnce', undefined, () =>
+      this.executePoll(options),
+    );
     this.activePollPromise = work;
     try {
       return await work;
@@ -148,19 +166,90 @@ export class WagerTransactionsConsumer implements OnApplicationBootstrap, OnModu
   /**
    * Processes a single SQS message from `wager-transactions.fifo`:
    * - Validates envelope & payload; forwards contract poison to DLQ before ACK.
+   * - Maintains a visibility lease heartbeat while the SQL transaction is in flight.
    * - Runs Inbox + WagerProcessorService.processInTransaction in one READ COMMITTED transaction.
    * - Calls DeleteMessage strictly AFTER PostgreSQL commits.
    */
   async handleMessage(message: Message, options: ConsumerMessageOptions = {}): Promise<HandleMessageOutcome> {
-    const { outcome } = await this.processReceivedMessage(message, options);
+    const { outcome } = await this.trackConsumerOperation(
+      'WagerTransactionsConsumer.handleMessage',
+      { sqsMessageId: message.MessageId },
+      async () => {
+        if (message.ReceiptHandle === undefined || this.stopping || this.shutdown?.isShuttingDown() === true) {
+          return this.processReceivedMessage(message, options);
+        }
+
+        const receivedAtMono = performance.now();
+        let queueUrl: string;
+        try {
+          queueUrl = await this.getMainQueueUrl();
+        } catch (error) {
+          if (error instanceof CooperativeBudgetExhaustedError) {
+            return {
+              outcome: { status: 'retry_later' as const, reason: error.message },
+              acknowledged: false,
+            };
+          }
+          throw error;
+        }
+
+        const visibilityTimeoutSeconds = await this.getMainQueueVisibilityTimeoutSeconds(queueUrl);
+        const leaseManager = new BatchVisibilityLeaseManager({
+          sqs: this.sqs,
+          queueUrl,
+          messages: [message],
+          visibilityTimeoutSeconds,
+          receivedAtMono,
+          defaultCallTimeoutMs: this.config.sqsCallTimeoutMs,
+          logger: this.logger,
+          ...(this.shutdown !== undefined ? { shutdown: this.shutdown } : {}),
+          isStopping: () => this.stopping || this.shutdown?.isShuttingDown() === true,
+          isGroupBlocked: () => false,
+        });
+        if (!leaseManager.claimForExecution(0)) {
+          return {
+            outcome: {
+              status: 'retry_later' as const,
+              reason: 'SQS visibility timeout elapsed before message execution started',
+            },
+            acknowledged: false,
+          };
+        }
+        leaseManager.start();
+
+        try {
+          return await this.processReceivedMessage(message, options, () => leaseManager.markCompleted(0), queueUrl);
+        } finally {
+          leaseManager.markCompleted(0);
+          await leaseManager.stop();
+        }
+      },
+    );
     return outcome;
   }
 
   private async processReceivedMessage(
     message: Message,
     options: ConsumerMessageOptions,
+    onBeforeAck?: () => void,
+    resolvedQueueUrl?: string,
   ): Promise<{ readonly outcome: HandleMessageOutcome; readonly acknowledged: boolean }> {
-    const queueUrl = await this.getMainQueueUrl();
+    let queueUrl: string;
+    if (resolvedQueueUrl !== undefined) {
+      queueUrl = resolvedQueueUrl;
+    } else {
+      try {
+        queueUrl = await this.getMainQueueUrl();
+      } catch (error) {
+        if (error instanceof CooperativeBudgetExhaustedError) {
+          return {
+            outcome: { status: 'retry_later', reason: error.message },
+            acknowledged: false,
+          };
+        }
+        throw error;
+      }
+    }
 
     let parsed: ParsedWagerMessage;
     try {
@@ -168,22 +257,22 @@ export class WagerTransactionsConsumer implements OnApplicationBootstrap, OnModu
     } catch (error) {
       const code = error instanceof DomainError ? error.code : FailureCode.InvalidPayload;
       const reason = error instanceof Error ? error.message : String(error);
+      onBeforeAck?.();
       return this.forwardPoisonToDlqAndAck(queueUrl, message, code, reason);
     }
 
-    const receivedAt = new Date();
     // Validate Inbox domain invariants before checking out a DB connection.
     InboxMessage.receive({
       consumerName: WAGER_CONSUMER_NAME,
       messageId: parsed.messageId,
       payloadHash: parsed.inboxPayloadHash,
-      receivedAt,
+      receivedAt: new Date(),
     });
 
     let txOutcome: TransactionalOutcome;
     try {
       txOutcome = await this.orm.em.fork().transactional(
-        (txEm) => this.executeInTransaction(txEm, parsed, receivedAt, options),
+        (txEm) => this.executeInTransaction(txEm, parsed, options),
         { isolationLevel: IsolationLevel.READ_COMMITTED },
       );
     } catch (error) {
@@ -198,6 +287,8 @@ export class WagerTransactionsConsumer implements OnApplicationBootstrap, OnModu
       });
       return { outcome: { status: 'retry_later', reason }, acknowledged: false };
     }
+
+    onBeforeAck?.();
 
     if (txOutcome.kind === 'inbox_hash_mismatch') {
       return this.forwardPoisonToDlqAndAck(
@@ -229,15 +320,16 @@ export class WagerTransactionsConsumer implements OnApplicationBootstrap, OnModu
   private async executeInTransaction(
     txEm: EntityManager,
     parsed: ParsedWagerMessage,
-    receivedAt: Date,
     options: ConsumerMessageOptions,
   ): Promise<TransactionalOutcome> {
+    const dbNow = await readDatabaseClock(txEm);
+
     // 1. Global lock hierarchy step 1: Inbox row lock (consumer_name, message_id).
     await txEm.execute(
       `insert into inbox_messages (consumer_name, message_id, payload_hash, received_at, processed_at)
        values (?, ?, ?, ?, null)
        on conflict (consumer_name, message_id) do nothing`,
-      [WAGER_CONSUMER_NAME, parsed.messageId, parsed.inboxPayloadHash, receivedAt],
+      [WAGER_CONSUMER_NAME, parsed.messageId, parsed.inboxPayloadHash, dbNow],
     );
 
     const rows = await txEm.execute<InboxRow[]>(
@@ -273,7 +365,7 @@ export class WagerTransactionsConsumer implements OnApplicationBootstrap, OnModu
     let processResult: ProcessWagerResult | undefined;
     let conflictCode: FailureCode | undefined;
     try {
-      processResult = await this.processor.processInTransaction(txEm, parsed.command);
+      processResult = await this.processor.processInTransaction(txEm, parsed.command, { now: dbNow });
     } catch (error) {
       if (error instanceof DomainError && TERMINAL_BUSINESS_CONFLICT_CODES.has(error.code)) {
         conflictCode = error.code;
@@ -283,7 +375,8 @@ export class WagerTransactionsConsumer implements OnApplicationBootstrap, OnModu
     }
 
     // 3. Mark inbox processed in the exact same SQL transaction.
-    const processedAt = new Date(Math.max(Date.now(), inbox.receivedAt.getTime()));
+    const commitStamp = await readDatabaseClock(txEm);
+    const processedAt = new Date(Math.max(commitStamp.getTime(), inbox.receivedAt.getTime()));
     inbox.markProcessed(processedAt);
 
     await txEm.execute(
@@ -307,8 +400,25 @@ export class WagerTransactionsConsumer implements OnApplicationBootstrap, OnModu
   }
 
   private async executePoll(options: PollOnceOptions): Promise<PollBatchStats> {
-    const queueUrl = await this.getMainQueueUrl();
-    if (this.stopping) {
+    if (this.stopping || this.shutdown?.isShuttingDown() === true) {
+      return emptyPollStats();
+    }
+
+    let queueUrl: string;
+    try {
+      queueUrl = await this.getMainQueueUrl();
+    } catch (error) {
+      if (
+        this.stopping ||
+        this.shutdown?.isShuttingDown() === true ||
+        error instanceof CooperativeBudgetExhaustedError
+      ) {
+        return emptyPollStats();
+      }
+      throw error;
+    }
+
+    if (this.stopping || this.shutdown?.isShuttingDown() === true) {
       return emptyPollStats();
     }
 
@@ -318,10 +428,15 @@ export class WagerTransactionsConsumer implements OnApplicationBootstrap, OnModu
 
     const stopController = new AbortController();
     const timeoutSignal = AbortSignal.timeout(receiveTimeoutMs);
-    const combinedSignal = AbortSignal.any([stopController.signal, timeoutSignal]);
+    const signals: AbortSignal[] = [stopController.signal, timeoutSignal];
+    if (this.shutdown !== undefined) {
+      signals.push(this.shutdown.shutdownSignal);
+    }
+    const combinedSignal = AbortSignal.any(signals);
     this.receiveAbort = stopController;
 
     let messages: Message[];
+    let receivedAtMono = performance.now();
     try {
       const response = await this.sqs.send(
         new ReceiveMessageCommand({
@@ -334,9 +449,10 @@ export class WagerTransactionsConsumer implements OnApplicationBootstrap, OnModu
         }),
         { abortSignal: combinedSignal },
       );
+      receivedAtMono = performance.now();
       messages = response.Messages ?? [];
     } catch (error) {
-      if (stopController.signal.aborted || this.stopping) {
+      if (stopController.signal.aborted || this.stopping || this.shutdown?.isShuttingDown() === true) {
         return emptyPollStats();
       }
       throw error;
@@ -345,6 +461,12 @@ export class WagerTransactionsConsumer implements OnApplicationBootstrap, OnModu
         this.receiveAbort = undefined;
       }
     }
+
+    if (messages.length === 0) {
+      return emptyPollStats();
+    }
+
+    const visibilityTimeoutSeconds = await this.getMainQueueVisibilityTimeoutSeconds(queueUrl);
 
     let processed = 0;
     let duplicates = 0;
@@ -358,57 +480,129 @@ export class WagerTransactionsConsumer implements OnApplicationBootstrap, OnModu
     // later messages of that group must NOT have VisibilityTimeout reset to 0 ahead of their predecessor.
     const inFlightPredecessorGroups = new Set<string>();
 
-    for (let index = 0; index < messages.length; index += 1) {
-      const message = messages[index];
-      if (message === undefined) {
-        continue;
-      }
+    const leaseManager = new BatchVisibilityLeaseManager({
+      sqs: this.sqs,
+      queueUrl,
+      messages,
+      visibilityTimeoutSeconds,
+      receivedAtMono,
+      defaultCallTimeoutMs: this.config.sqsCallTimeoutMs,
+      logger: this.logger,
+      ...(this.shutdown !== undefined ? { shutdown: this.shutdown } : {}),
+      isStopping: () => this.stopping || this.shutdown?.isShuttingDown() === true,
+      isGroupBlocked: (groupId) => blockedGroups.has(groupId) || inFlightPredecessorGroups.has(groupId),
+    });
+    leaseManager.start();
 
-      // On SIGTERM/stop, do not start remaining messages; batch-release only unblocked groups.
-      if (this.stopping) {
-        const releaseOutcome = await this.releaseRemainingVisibility(
-          queueUrl,
-          messages.slice(index),
-          inFlightPredecessorGroups,
-        );
-        visibilityReleased += releaseOutcome.released;
-        retried += releaseOutcome.withheld;
-        break;
-      }
+    try {
+      let inFlightMessageOnShutdown = 0;
+      for (let index = 0; index < messages.length; index += 1) {
+        const message = messages[index];
+        if (message === undefined) {
+          continue;
+        }
 
-      const groupId = message.Attributes?.MessageGroupId;
-      if (groupId !== undefined && blockedGroups.has(groupId)) {
-        // Preserve strict per-wallet FIFO order when an earlier message in the same group failed.
-        retried += 1;
-        continue;
-      }
+        // On SIGTERM/stop, halt lease renewals first, then batch-release only unblocked, still-owned groups.
+        if (this.stopping || this.shutdown?.isShuttingDown() === true) {
+          leaseManager.markReleasedFrom(index);
+          await leaseManager.stop();
+          const withheldGroups = new Set<string>([
+            ...inFlightPredecessorGroups,
+            ...leaseManager.lostGroupIds(),
+          ]);
+          const releaseOutcome = await this.releaseRemainingVisibility(
+            queueUrl,
+            messages.slice(index),
+            withheldGroups,
+          );
+          visibilityReleased += releaseOutcome.released;
+          retried += releaseOutcome.withheld;
+          this.logger.log({
+            message: 'SQS consumer shutdown drain summary',
+            batchSize: messages.length,
+            inFlightMessagesAtSignal: inFlightMessageOnShutdown,
+            processedInBatch: processed + duplicates + conflicts + deadLettered,
+            visibilityReleased,
+            withheldBehindPredecessor: retried,
+            leaseStates: leaseManager.leaseStateCounts(),
+          });
+          break;
+        }
 
-      const { outcome, acknowledged } = await this.processReceivedMessage(message, options);
-      if (!acknowledged && groupId !== undefined) {
-        inFlightPredecessorGroups.add(groupId);
-      }
+        const groupId = message.Attributes?.MessageGroupId;
+        if (groupId !== undefined && blockedGroups.has(groupId)) {
+          // Preserve strict per-wallet FIFO order when an earlier message in the same group failed.
+          retried += 1;
+          continue;
+        }
 
-      switch (outcome.status) {
-        case 'processed':
-          processed += 1;
-          break;
-        case 'duplicate':
-          duplicates += 1;
-          break;
-        case 'business_conflict':
-          conflicts += 1;
-          break;
-        case 'dead_lettered':
-          deadLettered += 1;
-          break;
-        case 'retry_later':
+        if (!leaseManager.claimForExecution(index)) {
+          // Another process may already own this group because SQS visibility expired before execution started.
           retried += 1;
           if (groupId !== undefined) {
             blockedGroups.add(groupId);
             inFlightPredecessorGroups.add(groupId);
           }
-          break;
+          continue;
+        }
+
+        const stoppingBeforeMessage = this.stopping || this.shutdown?.isShuttingDown() === true;
+        let outcome: HandleMessageOutcome;
+        let acknowledged: boolean;
+        try {
+          ({ outcome, acknowledged } = await this.processReceivedMessage(
+            message,
+            options,
+            () => leaseManager.markCompleted(index),
+            queueUrl,
+          ));
+        } finally {
+          if (!stoppingBeforeMessage && (this.stopping || this.shutdown?.isShuttingDown() === true)) {
+            inFlightMessageOnShutdown += 1;
+          }
+          leaseManager.markCompleted(index);
+        }
+
+        if (!acknowledged && groupId !== undefined) {
+          inFlightPredecessorGroups.add(groupId);
+        }
+
+        switch (outcome.status) {
+          case 'processed':
+            processed += 1;
+            break;
+          case 'duplicate':
+            duplicates += 1;
+            break;
+          case 'business_conflict':
+            conflicts += 1;
+            break;
+          case 'dead_lettered':
+            deadLettered += 1;
+            break;
+          case 'retry_later':
+            retried += 1;
+            if (groupId !== undefined) {
+              blockedGroups.add(groupId);
+              inFlightPredecessorGroups.add(groupId);
+            }
+            break;
+        }
+
+        if (index === messages.length - 1 && (this.stopping || this.shutdown?.isShuttingDown() === true)) {
+          this.logger.log({
+            message: 'SQS consumer shutdown drain summary',
+            batchSize: messages.length,
+            inFlightMessagesAtSignal: inFlightMessageOnShutdown,
+            processedInBatch: processed + duplicates + conflicts + deadLettered,
+            visibilityReleased,
+            withheldBehindPredecessor: retried,
+            leaseStates: leaseManager.leaseStateCounts(),
+          });
+        }
       }
+    } finally {
+      await leaseManager.stop();
     }
 
     return {
@@ -436,23 +630,31 @@ export class WagerTransactionsConsumer implements OnApplicationBootstrap, OnModu
     try {
       const dlqUrl = await this.getDlqUrl();
       const { messageGroupId, messageDeduplicationId } = deriveDlqRouting(message);
+      const budget = this.acquireSqsBudget('WagerTransactionsConsumer.forwardPoisonToDlq');
+      if (budget.exhausted) {
+        throw new CooperativeBudgetExhaustedError('WagerTransactionsConsumer.forwardPoisonToDlq');
+      }
 
-      await this.sqs.send(
-        new SendMessageCommand({
-          QueueUrl: dlqUrl,
-          MessageBody: message.Body ?? '',
-          MessageGroupId: messageGroupId,
-          MessageDeduplicationId: messageDeduplicationId,
-          MessageAttributes: {
-            failureCode: { DataType: 'String', StringValue: failureCode },
-            failureReason: { DataType: 'String', StringValue: reason.slice(0, 256) },
-            ...(message.MessageId !== undefined
-              ? { sourceSqsMessageId: { DataType: 'String', StringValue: message.MessageId } }
-              : {}),
-          },
-        }),
-        { abortSignal: AbortSignal.timeout(this.config.sqsCallTimeoutMs) },
-      );
+      try {
+        await this.sqs.send(
+          new SendMessageCommand({
+            QueueUrl: dlqUrl,
+            MessageBody: message.Body ?? '',
+            MessageGroupId: messageGroupId,
+            MessageDeduplicationId: messageDeduplicationId,
+            MessageAttributes: {
+              failureCode: { DataType: 'String', StringValue: failureCode },
+              failureReason: { DataType: 'String', StringValue: reason.slice(0, 256) },
+              ...(message.MessageId !== undefined
+                ? { sourceSqsMessageId: { DataType: 'String', StringValue: message.MessageId } }
+                : {}),
+            },
+          }),
+          { abortSignal: budget.signal },
+        );
+      } finally {
+        budget.dispose();
+      }
     } catch (error) {
       const dlqReason = error instanceof Error ? error.message : String(error);
       this.logger.error({
@@ -486,13 +688,21 @@ export class WagerTransactionsConsumer implements OnApplicationBootstrap, OnModu
     if (receiptHandle === undefined) {
       return true;
     }
+    const budget = this.acquireSqsBudget('WagerTransactionsConsumer.acknowledgeAfterCommit');
+    if (budget.exhausted) {
+      this.logger.warn({
+        message: 'Skipping SQS DeleteMessage after commit because cooperative shutdown budget is exhausted; redelivery will be deduplicated by inbox',
+        messageId,
+      });
+      return false;
+    }
     try {
       await this.sqs.send(
         new DeleteMessageCommand({
           QueueUrl: queueUrl,
           ReceiptHandle: receiptHandle,
         }),
-        { abortSignal: AbortSignal.timeout(this.config.sqsCallTimeoutMs) },
+        { abortSignal: budget.signal },
       );
       return true;
     } catch (error) {
@@ -503,6 +713,8 @@ export class WagerTransactionsConsumer implements OnApplicationBootstrap, OnModu
         reason: error instanceof Error ? error.message : String(error),
       });
       return false;
+    } finally {
+      budget.dispose();
     }
   }
 
@@ -578,10 +790,20 @@ export class WagerTransactionsConsumer implements OnApplicationBootstrap, OnModu
       }
     };
 
-    const releaseBudgetMs = Math.min(
+    const standaloneBudgetMs = Math.min(
       this.config.sqsCallTimeoutMs,
       Math.max(100, Math.floor(this.config.shutdownTimeoutMs * 0.8)),
     );
+    const releaseBudgetMs =
+      this.shutdown?.isShuttingDown() === true
+        ? Math.min(standaloneBudgetMs, this.shutdown.remainingCooperativeMs())
+        : standaloneBudgetMs;
+
+    if (releaseBudgetMs <= 0) {
+      drainRemainingQueuesAsWithheld('Cooperative shutdown budget exhausted before SQS visibility release');
+      return { released: 0, withheld };
+    }
+
     let budgetSignal: AbortSignal | undefined;
     let released = 0;
 
@@ -724,13 +946,14 @@ export class WagerTransactionsConsumer implements OnApplicationBootstrap, OnModu
         await this.pollOnce();
       } catch (error) {
         this.mainQueueUrl = undefined;
+        this.mainQueueVisibilityTimeoutSeconds = undefined;
         this.dlqUrl = undefined;
         this.logger.error({
           message: 'SQS consumer poll cycle failed',
           reason: error instanceof Error ? error.message : String(error),
         });
         if (this.running) {
-          await this.sleep(ERROR_BACKOFF_MS);
+          await this.sleep(computeJitteredDelayMs(ERROR_BACKOFF_MS));
         }
       }
     }
@@ -738,10 +961,19 @@ export class WagerTransactionsConsumer implements OnApplicationBootstrap, OnModu
 
   private async getMainQueueUrl(): Promise<string> {
     if (this.mainQueueUrl === undefined) {
-      const response = await this.sqs.send(
-        new GetQueueUrlCommand({ QueueName: this.config.wagerTransactionsQueue }),
-        { abortSignal: AbortSignal.timeout(this.config.sqsCallTimeoutMs) },
-      );
+      const budget = this.acquireSqsBudget('WagerTransactionsConsumer.getMainQueueUrl');
+      if (budget.exhausted) {
+        throw new CooperativeBudgetExhaustedError('WagerTransactionsConsumer.getMainQueueUrl');
+      }
+      let response;
+      try {
+        response = await this.sqs.send(
+          new GetQueueUrlCommand({ QueueName: this.config.wagerTransactionsQueue }),
+          { abortSignal: budget.signal },
+        );
+      } finally {
+        budget.dispose();
+      }
       if (!response.QueueUrl) {
         throw new Error(`Queue URL missing for ${this.config.wagerTransactionsQueue}`);
       }
@@ -750,18 +982,95 @@ export class WagerTransactionsConsumer implements OnApplicationBootstrap, OnModu
     return this.mainQueueUrl;
   }
 
+  private async getMainQueueVisibilityTimeoutSeconds(queueUrl: string): Promise<number> {
+    if (this.mainQueueVisibilityTimeoutSeconds !== undefined) {
+      return this.mainQueueVisibilityTimeoutSeconds;
+    }
+    if (this.stopping || this.shutdown?.isShuttingDown() === true) {
+      return DEFAULT_VISIBILITY_TIMEOUT_SECONDS;
+    }
+    const budget = this.acquireSqsBudget('WagerTransactionsConsumer.getMainQueueVisibilityTimeout');
+    if (budget.exhausted) {
+      return DEFAULT_VISIBILITY_TIMEOUT_SECONDS;
+    }
+    try {
+      const response = await this.sqs.send(
+        new GetQueueAttributesCommand({
+          QueueUrl: queueUrl,
+          AttributeNames: ['VisibilityTimeout'],
+        }),
+        { abortSignal: budget.signal },
+      );
+      const raw = response.Attributes?.VisibilityTimeout;
+      if (raw !== undefined && /^\d+$/.test(raw)) {
+        this.mainQueueVisibilityTimeoutSeconds = Number(raw);
+        return this.mainQueueVisibilityTimeoutSeconds;
+      }
+    } catch (error) {
+      this.logger.warn({
+        message: 'Failed to read SQS VisibilityTimeout attribute; using default visibility lease',
+        defaultSeconds: DEFAULT_VISIBILITY_TIMEOUT_SECONDS,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      budget.dispose();
+    }
+    this.mainQueueVisibilityTimeoutSeconds = DEFAULT_VISIBILITY_TIMEOUT_SECONDS;
+    return this.mainQueueVisibilityTimeoutSeconds;
+  }
+
   private async getDlqUrl(): Promise<string> {
     if (this.dlqUrl === undefined) {
-      const response = await this.sqs.send(
-        new GetQueueUrlCommand({ QueueName: this.config.wagerTransactionsDlq }),
-        { abortSignal: AbortSignal.timeout(this.config.sqsCallTimeoutMs) },
-      );
+      const budget = this.acquireSqsBudget('WagerTransactionsConsumer.getDlqUrl');
+      if (budget.exhausted) {
+        throw new CooperativeBudgetExhaustedError('WagerTransactionsConsumer.getDlqUrl');
+      }
+      let response;
+      try {
+        response = await this.sqs.send(
+          new GetQueueUrlCommand({ QueueName: this.config.wagerTransactionsDlq }),
+          { abortSignal: budget.signal },
+        );
+      } finally {
+        budget.dispose();
+      }
       if (!response.QueueUrl) {
         throw new Error(`Queue URL missing for ${this.config.wagerTransactionsDlq}`);
       }
       this.dlqUrl = response.QueueUrl;
     }
     return this.dlqUrl;
+  }
+
+  private acquireSqsBudget(operation: string) {
+    if (this.shutdown !== undefined) {
+      return this.shutdown.acquireSqsCallBudget(this.config.sqsCallTimeoutMs, operation);
+    }
+    return {
+      exhausted: false as const,
+      budgetMs: this.config.sqsCallTimeoutMs,
+      signal: AbortSignal.timeout(this.config.sqsCallTimeoutMs),
+      dispose: () => undefined,
+    };
+  }
+
+  private trackConsumerOperation<T>(
+    name: string,
+    context: Readonly<Record<string, string | undefined>> | undefined,
+    work: () => Promise<T>,
+  ): Promise<T> {
+    if (this.shutdown !== undefined) {
+      return this.shutdown.trackCriticalOperation(
+        {
+          kind: 'worker',
+          name,
+          resources: ['postgres', 'sqs'],
+          context,
+        },
+        work,
+      );
+    }
+    return work();
   }
 
   private sleep(ms: number): Promise<void> {

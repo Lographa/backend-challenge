@@ -1,12 +1,15 @@
 import { GetQueueUrlCommand, SendMessageBatchCommand, SQSClient } from '@aws-sdk/client-sqs';
 import { IsolationLevel } from '@mikro-orm/core';
 import { type EntityManager, MikroORM } from '@mikro-orm/postgresql';
-import { Injectable, Logger, type OnApplicationBootstrap, type OnModuleDestroy } from '@nestjs/common';
+import { Injectable, Logger, type OnApplicationBootstrap, type OnModuleDestroy, Optional } from '@nestjs/common';
 import { AppConfig } from '../common/config/env';
 import { DomainError } from '../common/errors/domain.error';
 import { FailureCode } from '../common/errors/failure-code';
+import { CooperativeBudgetExhaustedError, ShutdownService } from '../common/http/shutdown.service';
 import { isUuid } from '../common/ids';
+import { computeJitteredDelayMs } from '../common/instance/instance-identity';
 import { OUTBOX_QUARANTINED_UNTIL_MS, OutboxMessage } from '../common/messaging/outbox-message';
+import { readDatabaseClock } from '../database/clock';
 
 const MAX_SQS_BATCH_SIZE = 10;
 
@@ -41,24 +44,34 @@ export interface PublishBatchStats {
 export class OutboxPublisherService implements OnApplicationBootstrap, OnModuleDestroy {
   private readonly logger = new Logger(OutboxPublisherService.name);
   private running = false;
+  private stopping = false;
   private loopPromise: Promise<void> | undefined;
   private wakeWaiter: (() => void) | undefined;
   private activeBatchPromise: Promise<PublishBatchStats> | undefined;
   private integrationQueueUrl: string | undefined;
+  private detachShutdownWake: (() => void) | undefined;
 
   constructor(
     private readonly orm: MikroORM,
     private readonly sqs: SQSClient,
     private readonly config: AppConfig,
+    @Optional() private readonly shutdown?: ShutdownService,
   ) {}
 
   onApplicationBootstrap(): void {
-    if (this.config.workersEnabled) {
+    if (this.config.workersEnabled && this.shutdown?.isShuttingDown() !== true) {
       this.start();
     }
   }
 
   async onModuleDestroy(): Promise<void> {
+    if (this.shutdown !== undefined) {
+      await this.shutdown.runWithinCooperativeBudget(OutboxPublisherService.name, () => this.stop(), [
+        'postgres',
+        'sqs',
+      ]);
+      return;
+    }
     await this.stop();
   }
 
@@ -66,16 +79,30 @@ export class OutboxPublisherService implements OnApplicationBootstrap, OnModuleD
     if (this.running) {
       return;
     }
+    this.stopping = false;
     this.running = true;
+    if (this.shutdown !== undefined && !this.shutdown.shutdownSignal.aborted) {
+      const onShutdownAbort = (): void => {
+        this.wakeWaiter?.();
+      };
+      this.shutdown.shutdownSignal.addEventListener('abort', onShutdownAbort, { once: true });
+      this.detachShutdownWake = () => {
+        this.shutdown?.shutdownSignal.removeEventListener('abort', onShutdownAbort);
+      };
+    }
     this.loopPromise = this.runLoop();
   }
 
   async stop(): Promise<void> {
+    this.stopping = true;
     this.running = false;
+    this.detachShutdownWake?.();
+    this.detachShutdownWake = undefined;
     this.wakeWaiter?.();
     await this.loopPromise;
     this.loopPromise = undefined;
     await this.activeBatchPromise;
+    this.stopping = false;
   }
 
   clearQueueUrlCache(): void {
@@ -90,7 +117,9 @@ export class OutboxPublisherService implements OnApplicationBootstrap, OnModuleD
     if (this.activeBatchPromise !== undefined) {
       return this.activeBatchPromise;
     }
-    const work = this.executeBatch(options);
+    const work = this.trackOutboxOperation('OutboxPublisherService.publishBatch', ['postgres', 'sqs'], undefined, () =>
+      this.executeBatch(options),
+    );
     this.activeBatchPromise = work;
     try {
       return await work;
@@ -105,29 +134,38 @@ export class OutboxPublisherService implements OnApplicationBootstrap, OnModuleD
    * Operator recovery action: makes the quarantined head event of an aggregate eligible for
    * immediate retry without decreasing `attempts` and without unblocking events behind it out of order.
    */
-  async requeueQuarantinedAggregate(aggregateId: string, now = new Date()): Promise<string | undefined> {
+  async requeueQuarantinedAggregate(aggregateId: string, now?: Date): Promise<string | undefined> {
     if (!isUuid(aggregateId)) {
       throw new DomainError(FailureCode.InvalidPayload, 'aggregateId must be a UUID');
     }
-    const rows = await this.orm.em.fork().execute<{ id: string }[]>(
-      `with head as (
-         select id
-         from outbox_messages
-         where aggregate_id = ?
-           and published_at is null
-           and next_attempt_at = ?
-         order by sequence_number asc
-         limit 1
-         for update
-       )
-       update outbox_messages o
-       set next_attempt_at = ?
-       from head
-       where o.id = head.id
-       returning o.id`,
-      [aggregateId, new Date(OUTBOX_QUARANTINED_UNTIL_MS), now],
+    return this.trackOutboxOperation(
+      'OutboxPublisherService.requeueQuarantinedAggregate',
+      ['postgres'],
+      { aggregateId },
+      async () => {
+        const em = this.orm.em.fork();
+        const effectiveNow = now ?? (await readDatabaseClock(em));
+        const rows = await em.execute<{ id: string }[]>(
+          `with head as (
+             select id
+             from outbox_messages
+             where aggregate_id = ?
+               and published_at is null
+               and next_attempt_at = ?
+             order by sequence_number asc
+             limit 1
+             for update
+           )
+           update outbox_messages o
+           set next_attempt_at = ?
+           from head
+           where o.id = head.id
+           returning o.id`,
+          [aggregateId, new Date(OUTBOX_QUARANTINED_UNTIL_MS), effectiveNow],
+        );
+        return rows[0]?.id;
+      },
     );
-    return rows[0]?.id;
   }
 
   private async executeBatch(options: PublishBatchOptions): Promise<PublishBatchStats> {
@@ -136,7 +174,9 @@ export class OutboxPublisherService implements OnApplicationBootstrap, OnModuleD
       throw new RangeError(`batchSize must be an integer between 1 and ${MAX_SQS_BATCH_SIZE}`);
     }
 
-    const now = options.now ?? new Date();
+    if (this.stopping || (this.shutdown?.isShuttingDown() === true && this.shutdown.remainingCooperativeMs() <= 0)) {
+      return emptyPublishStats();
+    }
 
     // Resolve the target queue URL before acquiring row locks in PostgreSQL, unless nothing is due.
     let queueUrl: string;
@@ -144,11 +184,19 @@ export class OutboxPublisherService implements OnApplicationBootstrap, OnModuleD
       queueUrl = await this.getIntegrationQueueUrl();
     } catch (error) {
       this.integrationQueueUrl = undefined;
-      return this.recordQueueResolutionFailure(now, batchSize, error);
+      if (
+        this.stopping ||
+        error instanceof CooperativeBudgetExhaustedError ||
+        (this.shutdown?.isShuttingDown() === true && this.shutdown.remainingCooperativeMs() <= 0)
+      ) {
+        return emptyPublishStats();
+      }
+      return this.recordQueueResolutionFailure(options.now, batchSize, error);
     }
 
     return this.orm.em.fork().transactional(
       async (txEm) => {
+        const effectiveNow = options.now ?? (await readDatabaseClock(txEm));
         const rows = await txEm.execute<OutboxHeadRow[]>(
           `select o.id,
                   o.sequence_number,
@@ -172,7 +220,7 @@ export class OutboxPublisherService implements OnApplicationBootstrap, OnModuleD
            order by o.sequence_number asc
            limit ?
            for update of o skip locked`,
-          [now, batchSize],
+          [effectiveNow, batchSize],
         );
 
         if (rows.length === 0) {
@@ -186,6 +234,15 @@ export class OutboxPublisherService implements OnApplicationBootstrap, OnModuleD
         }
 
         const messages = rows.map(rehydrateOutboxRow);
+        const budget = this.acquireSqsBudget('OutboxPublisherService.SendMessageBatch');
+        if (budget.exhausted) {
+          this.logger.warn({
+            message: 'Skipping Outbox SQS batch send because cooperative shutdown budget is exhausted',
+            selectedCount: messages.length,
+          });
+          return emptyPublishStats();
+        }
+
         const succeededIds = new Set<string>();
 
         try {
@@ -199,7 +256,7 @@ export class OutboxPublisherService implements OnApplicationBootstrap, OnModuleD
                 MessageDeduplicationId: msg.id,
               })),
             }),
-            { abortSignal: AbortSignal.timeout(this.config.sqsCallTimeoutMs) },
+            { abortSignal: budget.signal },
           );
           for (const item of response.Successful ?? []) {
             if (item.Id !== undefined) {
@@ -222,16 +279,18 @@ export class OutboxPublisherService implements OnApplicationBootstrap, OnModuleD
             batchCount: messages.length,
             reason: error instanceof Error ? error.message : String(error),
           });
+        } finally {
+          budget.dispose();
         }
 
+        const stampNow = options.now ?? (await readDatabaseClock(txEm));
         const publishedIds: string[] = [];
         let failed = 0;
         let quarantined = 0;
 
         for (const msg of messages) {
           if (succeededIds.has(msg.id)) {
-            const publishedAt = options.now ?? new Date();
-            msg.markPublished(publishedAt);
+            msg.markPublished(stampNow);
             const state = msg.toState();
             await txEm.execute(
               `update outbox_messages
@@ -241,8 +300,7 @@ export class OutboxPublisherService implements OnApplicationBootstrap, OnModuleD
             );
             publishedIds.push(msg.id);
           } else {
-            const retryAtBase = options.now ?? new Date();
-            msg.scheduleRetry(retryAtBase);
+            msg.scheduleRetry(stampNow);
             const state = msg.toState();
             await txEm.execute(
               `update outbox_messages
@@ -285,7 +343,7 @@ export class OutboxPublisherService implements OnApplicationBootstrap, OnModuleD
    * still record a failed attempt and advance exponential backoff cleanly.
    */
   private async recordQueueResolutionFailure(
-    now: Date,
+    explicitNow: Date | undefined,
     batchSize: number,
     cause: unknown,
   ): Promise<PublishBatchStats> {
@@ -297,6 +355,7 @@ export class OutboxPublisherService implements OnApplicationBootstrap, OnModuleD
 
     return this.orm.em.fork().transactional(
       async (txEm) => {
+        const effectiveNow = explicitNow ?? (await readDatabaseClock(txEm));
         const rows = await txEm.execute<OutboxHeadRow[]>(
           `select o.id,
                   o.sequence_number,
@@ -320,13 +379,13 @@ export class OutboxPublisherService implements OnApplicationBootstrap, OnModuleD
            order by o.sequence_number asc
            limit ?
            for update of o skip locked`,
-          [now, batchSize],
+          [effectiveNow, batchSize],
         );
 
         let quarantined = 0;
         for (const row of rows) {
           const msg = rehydrateOutboxRow(row);
-          msg.scheduleRetry(now);
+          msg.scheduleRetry(effectiveNow);
           const state = msg.toState();
           await txEm.execute(
             `update outbox_messages
@@ -353,10 +412,19 @@ export class OutboxPublisherService implements OnApplicationBootstrap, OnModuleD
 
   private async getIntegrationQueueUrl(): Promise<string> {
     if (this.integrationQueueUrl === undefined) {
-      const response = await this.sqs.send(
-        new GetQueueUrlCommand({ QueueName: this.config.integrationEventsQueue }),
-        { abortSignal: AbortSignal.timeout(this.config.sqsCallTimeoutMs) },
-      );
+      const budget = this.acquireSqsBudget('OutboxPublisherService.getIntegrationQueueUrl');
+      if (budget.exhausted) {
+        throw new CooperativeBudgetExhaustedError('OutboxPublisherService.getIntegrationQueueUrl');
+      }
+      let response;
+      try {
+        response = await this.sqs.send(
+          new GetQueueUrlCommand({ QueueName: this.config.integrationEventsQueue }),
+          { abortSignal: budget.signal },
+        );
+      } finally {
+        budget.dispose();
+      }
       if (!response.QueueUrl) {
         throw new Error(`Queue URL missing for ${this.config.integrationEventsQueue}`);
       }
@@ -365,8 +433,40 @@ export class OutboxPublisherService implements OnApplicationBootstrap, OnModuleD
     return this.integrationQueueUrl;
   }
 
+  private acquireSqsBudget(operation: string) {
+    if (this.shutdown !== undefined) {
+      return this.shutdown.acquireSqsCallBudget(this.config.sqsCallTimeoutMs, operation);
+    }
+    return {
+      exhausted: false as const,
+      budgetMs: this.config.sqsCallTimeoutMs,
+      signal: AbortSignal.timeout(this.config.sqsCallTimeoutMs),
+      dispose: () => undefined,
+    };
+  }
+
+  private trackOutboxOperation<T>(
+    name: string,
+    resources: readonly ('postgres' | 'sqs')[],
+    context: Readonly<Record<string, string | undefined>> | undefined,
+    work: () => Promise<T>,
+  ): Promise<T> {
+    if (this.shutdown !== undefined) {
+      return this.shutdown.trackCriticalOperation(
+        {
+          kind: 'outbox_publish',
+          name,
+          resources,
+          context,
+        },
+        work,
+      );
+    }
+    return work();
+  }
+
   private async runLoop(): Promise<void> {
-    while (this.running) {
+    while (this.running && this.shutdown?.isShuttingDown() !== true) {
       let stats: PublishBatchStats | undefined;
       try {
         stats = await this.publishBatch();
@@ -377,13 +477,13 @@ export class OutboxPublisherService implements OnApplicationBootstrap, OnModuleD
         });
       }
 
-      if (!this.running) {
+      if (!this.running || this.shutdown?.isShuttingDown() === true) {
         break;
       }
 
       // Immediately drain subsequent events of aggregates that just advanced; sleep when idle or failing.
       if (stats === undefined || stats.published === 0) {
-        await this.sleep(this.config.outboxPollIntervalMs);
+        await this.sleep(computeJitteredDelayMs(this.config.outboxPollIntervalMs));
       }
     }
   }
@@ -419,6 +519,16 @@ function rehydrateOutboxRow(row: OutboxHeadRow): OutboxMessage {
     nextAttemptAt: row.next_attempt_at === null ? null : toDate(row.next_attempt_at),
     publishedAt: row.published_at === null ? null : toDate(row.published_at),
   });
+}
+
+function emptyPublishStats(): PublishBatchStats {
+  return {
+    selected: 0,
+    published: 0,
+    failed: 0,
+    quarantined: 0,
+    publishedIds: [],
+  };
 }
 
 function toDate(value: Date | string): Date {

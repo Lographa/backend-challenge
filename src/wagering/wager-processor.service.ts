@@ -1,12 +1,15 @@
 import { IsolationLevel, LockMode, UniqueConstraintViolationException } from '@mikro-orm/core';
 import { type EntityManager, MikroORM } from '@mikro-orm/postgresql';
-import { Injectable, Optional } from '@nestjs/common';
+import { Injectable, Optional, ServiceUnavailableException } from '@nestjs/common';
 import { AppConfig } from '../common/config/env';
 import { DomainError, InvalidStateError } from '../common/errors/domain.error';
 import { FailureCode } from '../common/errors/failure-code';
+import { SERVICE_UNAVAILABLE_CODE } from '../common/http/domain-exception.filter';
+import { ShutdownService } from '../common/http/shutdown.service';
 import { isUuid, newId } from '../common/ids';
 import type { EventContext, IntegrationEvent } from '../common/messaging/integration-event';
 import { WagerTransactionRecord, WalletLedgerEntryRecord, WalletRecord } from '../database/entities';
+import { readDatabaseClock } from '../database/clock';
 import { enqueueEvents } from '../database/outbox';
 import { Wallet } from '../wallets/wallet';
 import { WalletBalanceChanged } from '../wallets/wallet-events';
@@ -84,15 +87,24 @@ export class WagerProcessorService {
   constructor(
     private readonly orm: MikroORM,
     @Optional() private readonly config?: AppConfig,
+    @Optional() private readonly shutdown?: ShutdownService,
   ) {}
 
   /** Entry point when the caller does not already own a SQL transaction (HTTP). */
   async process(command: SubmitWagerCommand): Promise<ProcessWagerResult> {
     // Validate domain invariants before checking out a pooled connection.
     buildCandidate(command, new Date());
-    return this.orm.em.fork().transactional(
-      (txEm) => this.processInTransaction(txEm, command),
-      { isolationLevel: IsolationLevel.READ_COMMITTED },
+    return this.runPostgresOperation(
+      'WagerProcessorService.process',
+      {
+        walletId: command.walletId,
+        correlationId: command.correlationId,
+      },
+      () =>
+        this.orm.em.fork().transactional(
+          (txEm) => this.processInTransaction(txEm, command),
+          { isolationLevel: IsolationLevel.READ_COMMITTED },
+        ),
     );
   }
 
@@ -102,12 +114,16 @@ export class WagerProcessorService {
    *
    * Lock order: (caller inbox) -> wallets FOR UPDATE -> wager_transactions -> ledger / outbox.
    */
-  async processInTransaction(txEm: EntityManager, command: SubmitWagerCommand): Promise<ProcessWagerResult> {
+  async processInTransaction(
+    txEm: EntityManager,
+    command: SubmitWagerCommand,
+    options?: { readonly now?: Date },
+  ): Promise<ProcessWagerResult> {
     if (!txEm.isInTransaction()) {
       throw new InvalidStateError('WagerProcessorService.processInTransaction requires an active transaction');
     }
 
-    const now = new Date();
+    const now = options?.now ?? (await readDatabaseClock(txEm));
     const candidate = buildCandidate(command, now);
     const ctx: EventContext = {
       correlationId: command.correlationId,
@@ -167,7 +183,7 @@ export class WagerProcessorService {
       throw new DomainError(FailureCode.InvalidPayload, 'transactionId and walletId must be UUIDs');
     }
 
-    const now = options?.now ?? new Date();
+    const now = options?.now ?? (await readDatabaseClock(txEm));
     const policy = options?.policy ?? this.defaultPendingPolicy();
     let cachedCtx: EventContext | undefined;
 
@@ -211,27 +227,60 @@ export class WagerProcessorService {
     if (!isUuid(transactionId)) {
       throw new DomainError(FailureCode.InvalidPayload, 'transactionId must be a UUID');
     }
-    const record = await this.orm.em.fork().findOne(WagerTransactionRecord, transactionId);
-    if (record === null) {
-      throw new DomainError(FailureCode.TransactionNotFound, `Transaction ${transactionId} does not exist`);
-    }
-    return WagerTransaction.rehydrate(record);
+    return this.runPostgresOperation('WagerProcessorService.getById', { transactionId }, async () => {
+      const record = await this.orm.em.fork().findOne(WagerTransactionRecord, transactionId);
+      if (record === null) {
+        throw new DomainError(FailureCode.TransactionNotFound, `Transaction ${transactionId} does not exist`);
+      }
+      return WagerTransaction.rehydrate(record);
+    });
   }
 
   async getByExternalId(providerId: string, externalTransactionId: string): Promise<WagerTransaction> {
     assertLookupIdentifier('providerId', providerId, MAX_PROVIDER_ID_LENGTH);
     assertLookupIdentifier('externalTransactionId', externalTransactionId, MAX_EXTERNAL_ID_LENGTH);
-    const record = await this.orm.em.fork().findOne(WagerTransactionRecord, {
-      providerId,
-      externalTransactionId,
+    return this.runPostgresOperation('WagerProcessorService.getByExternalId', { providerId }, async () => {
+      const record = await this.orm.em.fork().findOne(WagerTransactionRecord, {
+        providerId,
+        externalTransactionId,
+      });
+      if (record === null) {
+        throw new DomainError(
+          FailureCode.TransactionNotFound,
+          `Transaction ${providerId}:${externalTransactionId} does not exist`,
+        );
+      }
+      return WagerTransaction.rehydrate(record);
     });
-    if (record === null) {
-      throw new DomainError(
-        FailureCode.TransactionNotFound,
-        `Transaction ${providerId}:${externalTransactionId} does not exist`,
+  }
+
+  private runPostgresOperation<T>(
+    name: string,
+    context: Readonly<Record<string, string | undefined>>,
+    work: () => Promise<T>,
+  ): Promise<T> {
+    if (this.shutdown !== undefined) {
+      if (
+        this.shutdown.isShuttingDown() &&
+        (this.shutdown.isHttpDrainCompleted() || this.shutdown.remainingCooperativeMs() <= 0)
+      ) {
+        throw new ServiceUnavailableException({
+          code: SERVICE_UNAVAILABLE_CODE,
+          message: 'Service is shutting down; retry later',
+          ...(context.correlationId !== undefined ? { correlationId: context.correlationId } : {}),
+        });
+      }
+      return this.shutdown.trackCriticalOperation(
+        {
+          kind: 'http_financial',
+          name,
+          resources: ['postgres'],
+          context,
+        },
+        work,
       );
     }
-    return WagerTransaction.rehydrate(record);
+    return work();
   }
 
   private defaultPendingPolicy(): PendingReferencePolicy {

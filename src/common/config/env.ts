@@ -1,4 +1,5 @@
 import type { LogLevel } from '@nestjs/common';
+import { generateDefaultInstanceId, isValidInstanceId } from '../instance/instance-identity';
 
 const LOG_LEVELS = ['fatal', 'error', 'warn', 'log', 'debug', 'verbose'] as const;
 const LOG_LEVEL_ALIASES: Record<string, LogLevel> = { info: 'log' };
@@ -30,6 +31,7 @@ export class AppConfig {
     readonly pendingReferencePollIntervalMs: number,
     readonly pendingReferenceTtlMs: number,
     readonly pendingReferenceMaxAttempts: number,
+    readonly instanceId: string = generateDefaultInstanceId(),
   ) {}
 
   static load(source: Record<string, string | undefined>): AppConfig {
@@ -37,7 +39,7 @@ export class AppConfig {
     const read = new EnvReader(source, issues);
 
     const config = new AppConfig(
-      read.integer('PORT', { default: 3000, min: 1, max: 65535 }),
+      read.integer('PORT', { default: 3000, min: 0, max: 65535 }),
       read.logLevel('LOG_LEVEL', 'log'),
       read.url('DATABASE_URL', ['postgres:', 'postgresql:']),
       read.integer('DATABASE_POOL_MAX', { default: 10, min: 1, max: 100 }),
@@ -55,6 +57,7 @@ export class AppConfig {
       read.integer('PENDING_REFERENCE_POLL_INTERVAL_MS', { default: 250, min: 10, max: 60000 }),
       read.integer('PENDING_REFERENCE_TTL_MS', { default: 60000, min: 100, max: 86400000 }),
       read.integer('PENDING_REFERENCE_MAX_ATTEMPTS', { default: 10, min: 1, max: 100 }),
+      read.instanceId('INSTANCE_ID'),
     );
 
     if (issues.length > 0) {
@@ -145,6 +148,18 @@ class EnvReader {
     }
     this.issues.push(`${name} must be true or false`);
     return fallback;
+  }
+
+  instanceId(name: string): string {
+    const value = this.raw(name);
+    if (value === undefined) {
+      return generateDefaultInstanceId();
+    }
+    if (!isValidInstanceId(value)) {
+      this.issues.push(`${name} must be 1..63 ASCII characters matching [A-Za-z0-9._:-] starting with alphanumeric`);
+      return generateDefaultInstanceId();
+    }
+    return value;
   }
 
   private checkUrl(name: string, value: string, protocols: string[]): void {
