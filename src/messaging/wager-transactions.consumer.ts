@@ -15,8 +15,10 @@ import { Injectable, Logger, type OnApplicationBootstrap, type OnModuleDestroy, 
 import { AppConfig } from '../common/config/env';
 import { DomainError } from '../common/errors/domain.error';
 import { FailureCode } from '../common/errors/failure-code';
-import { isTransientInfrastructureError } from '../common/errors/transient-error';
+import { isTransientInfrastructureError, lockConflictSqlState, retryCause } from '../common/errors/transient-error';
 import { CooperativeBudgetExhaustedError, ShutdownService } from '../common/http/shutdown.service';
+import { definedFields, safeErrorFields } from '../common/observability/log-fields';
+import { guardMetrics, MetricsRegistry, recordStatusTransition } from '../common/observability/metrics';
 import { computeJitteredDelayMs } from '../common/instance/instance-identity';
 import { InboxMessage } from '../common/messaging/inbox-message';
 import { readDatabaseClock } from '../database/clock';
@@ -100,6 +102,7 @@ export class WagerTransactionsConsumer implements OnApplicationBootstrap, OnModu
     private readonly processor: WagerProcessorService,
     private readonly config: AppConfig,
     @Optional() private readonly shutdown?: ShutdownService,
+    @Optional() private readonly metrics?: MetricsRegistry,
   ) {}
 
   onApplicationBootstrap(): void {
@@ -270,6 +273,7 @@ export class WagerTransactionsConsumer implements OnApplicationBootstrap, OnModu
     });
 
     let txOutcome: TransactionalOutcome;
+    const started = performance.now();
     try {
       txOutcome = await this.orm.em.fork().transactional(
         (txEm) => this.executeInTransaction(txEm, parsed, options),
@@ -277,16 +281,42 @@ export class WagerTransactionsConsumer implements OnApplicationBootstrap, OnModu
       );
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
-      this.logger.warn({
-        message: 'Wager SQS message transaction rolled back; leaving message unacknowledged for retry',
-        messageId: parsed.messageId,
-        walletId: parsed.command.walletId,
-        transient: isTransientInfrastructureError(error),
-        code: error instanceof DomainError ? error.code : undefined,
-        reason,
+      guardMetrics(() => {
+        this.metrics?.observe('wager_processing_duration_ms', performance.now() - started, {
+          channel: 'sqs',
+          outcome: 'error',
+        });
+        this.metrics?.increment('wager_retries_total', { channel: 'sqs', cause: retryCause(error) });
+        const sqlstate = lockConflictSqlState(error);
+        if (sqlstate !== undefined) {
+          this.metrics?.increment('wager_lock_conflicts_total', { sqlstate });
+        }
       });
+      try {
+        this.logger.warn(
+          'Wager SQS message transaction rolled back; leaving message unacknowledged for retry',
+          definedFields({
+            correlationId: parsed.command.correlationId,
+            messageId: parsed.messageId,
+            walletId: parsed.command.walletId,
+            providerId: parsed.command.providerId,
+            transient: isTransientInfrastructureError(error),
+            ...safeErrorFields(error),
+          }),
+        );
+      } catch {
+        // A log failure must not acknowledge the message or hide the rollback.
+      }
       return { outcome: { status: 'retry_later', reason }, acknowledged: false };
     }
+
+    guardMetrics(() => {
+      this.metrics?.observe('wager_processing_duration_ms', performance.now() - started, {
+        channel: 'sqs',
+        outcome: 'completed',
+      });
+      this.recordCommittedSqsOutcome(txOutcome);
+    });
 
     onBeforeAck?.();
 
@@ -657,27 +687,63 @@ export class WagerTransactionsConsumer implements OnApplicationBootstrap, OnModu
       }
     } catch (error) {
       const dlqReason = error instanceof Error ? error.message : String(error);
-      this.logger.error({
-        message: 'Failed to forward poison message to DLQ; leaving unacknowledged for native redrive',
-        sqsMessageId: message.MessageId,
-        failureCode,
-        reason: dlqReason,
-      });
+      try {
+        this.logger.error('Failed to forward poison message to DLQ; leaving unacknowledged for native redrive', {
+          sqsMessageId: message.MessageId,
+          failureCode,
+          ...safeErrorFields(error),
+        });
+      } catch {
+        // Logging must not turn a failed DLQ send into an acknowledgement.
+      }
       return { outcome: { status: 'retry_later', reason: dlqReason }, acknowledged: false };
     }
 
+    const receiptHandle = message.ReceiptHandle;
     const acknowledged = await this.acknowledgeAfterCommit(
       mainQueueUrl,
-      message.ReceiptHandle,
+      receiptHandle,
       message.MessageId ?? 'poison',
     );
-    this.logger.warn({
-      message: 'Poison message forwarded to DLQ and acknowledged',
-      sqsMessageId: message.MessageId,
-      failureCode,
-      reason,
-    });
+    // A missing receipt handle returns acknowledged without executing DeleteMessage.
+    // That is not a completed forward for the metric or for the ack log.
+    if (receiptHandle !== undefined && acknowledged) {
+      guardMetrics(() => {
+        this.metrics?.increment('wager_dlq_forwards_completed_total');
+      });
+      try {
+        this.logger.warn('Poison message forwarded to DLQ and acknowledged', {
+          sqsMessageId: message.MessageId,
+          failureCode,
+          reason,
+        });
+      } catch {
+        // The DLQ write and source delete already finished.
+      }
+    }
     return { outcome: { status: 'dead_lettered', reason, failureCode }, acknowledged };
+  }
+
+  private recordCommittedSqsOutcome(txOutcome: TransactionalOutcome): void {
+    if (txOutcome.kind === 'duplicate') {
+      this.metrics?.increment('wager_duplicates_total', { cause: 'inbox' });
+      return;
+    }
+    if (txOutcome.kind === 'inbox_hash_mismatch') {
+      this.metrics?.increment('wager_hash_conflicts_total', { cause: 'inbox_payload' });
+      return;
+    }
+    if (txOutcome.kind === 'business_conflict') {
+      if (txOutcome.code === FailureCode.IdempotencyPayloadConflict) {
+        this.metrics?.increment('wager_hash_conflicts_total', { cause: 'idempotency' });
+      }
+      return;
+    }
+    if (txOutcome.result.idempotentReplay) {
+      this.metrics?.increment('wager_duplicates_total', { cause: 'idempotency_replay' });
+      return;
+    }
+    recordStatusTransition(this.metrics, txOutcome.result.transaction.status);
   }
 
   private async acknowledgeAfterCommit(
@@ -707,11 +773,14 @@ export class WagerTransactionsConsumer implements OnApplicationBootstrap, OnModu
       return true;
     } catch (error) {
       // Transaction is already committed; redelivery will hit inbox.isProcessed() and ACK cleanly.
-      this.logger.warn({
-        message: 'DeleteMessage failed after commit; redelivery will be deduplicated by inbox',
-        messageId,
-        reason: error instanceof Error ? error.message : String(error),
-      });
+      try {
+        this.logger.warn('DeleteMessage failed after commit; redelivery will be deduplicated by inbox', {
+          messageId,
+          ...safeErrorFields(error),
+        });
+      } catch {
+        // A log failure must still leave the message unacknowledged.
+      }
       return false;
     } finally {
       budget.dispose();

@@ -5,13 +5,32 @@ import { Injectable, Logger, type OnApplicationBootstrap, type OnModuleDestroy, 
 import { AppConfig } from '../common/config/env';
 import { DomainError } from '../common/errors/domain.error';
 import { FailureCode } from '../common/errors/failure-code';
+import { lockConflictSqlState } from '../common/errors/transient-error';
 import { CooperativeBudgetExhaustedError, ShutdownService } from '../common/http/shutdown.service';
 import { isUuid } from '../common/ids';
 import { computeJitteredDelayMs } from '../common/instance/instance-identity';
 import { OUTBOX_QUARANTINED_UNTIL_MS, OutboxMessage } from '../common/messaging/outbox-message';
+import { safeErrorFields } from '../common/observability/log-fields';
+import { guardMetrics, MetricsRegistry } from '../common/observability/metrics';
 import { readDatabaseClock } from '../database/clock';
 
 const MAX_SQS_BATCH_SIZE = 10;
+const OUTBOX_LAG_SAMPLE_INTERVAL_MS = 1_000;
+
+/** Oldest unpublished outbox age. No row lock and no new index; the caller samples at most once a second. */
+export const OUTBOX_OLDEST_UNPUBLISHED_LAG_SQL =
+  'select floor(extract(epoch from (clock_timestamp() - occurred_at)) * 1000)::bigint as lag_ms from outbox_messages where published_at is null order by occurred_at asc limit 1';
+
+export function outboxLagMilliseconds(raw: string | number | bigint | null | undefined): number {
+  if (raw === undefined || raw === null) {
+    return 0;
+  }
+  const value = typeof raw === 'bigint' ? Number(raw) : Number(raw);
+  if (!Number.isFinite(value) || value <= 0) {
+    return 0;
+  }
+  return value;
+}
 
 interface OutboxHeadRow {
   id: string;
@@ -50,12 +69,14 @@ export class OutboxPublisherService implements OnApplicationBootstrap, OnModuleD
   private activeBatchPromise: Promise<PublishBatchStats> | undefined;
   private integrationQueueUrl: string | undefined;
   private detachShutdownWake: (() => void) | undefined;
+  private lastOutboxLagSampleAt = Number.NEGATIVE_INFINITY;
 
   constructor(
     private readonly orm: MikroORM,
     private readonly sqs: SQSClient,
     private readonly config: AppConfig,
     @Optional() private readonly shutdown?: ShutdownService,
+    @Optional() private readonly metrics?: MetricsRegistry,
   ) {}
 
   onApplicationBootstrap(): void {
@@ -122,7 +143,9 @@ export class OutboxPublisherService implements OnApplicationBootstrap, OnModuleD
     );
     this.activeBatchPromise = work;
     try {
-      return await work;
+      const stats = await work;
+      this.recordCommittedOutboxRetries(stats);
+      return stats;
     } finally {
       if (this.activeBatchPromise === work) {
         this.activeBatchPromise = undefined;
@@ -236,8 +259,7 @@ export class OutboxPublisherService implements OnApplicationBootstrap, OnModuleD
         const messages = rows.map(rehydrateOutboxRow);
         const budget = this.acquireSqsBudget('OutboxPublisherService.SendMessageBatch');
         if (budget.exhausted) {
-          this.logger.warn({
-            message: 'Skipping Outbox SQS batch send because cooperative shutdown budget is exhausted',
+          this.safeLog('warn', 'Skipping Outbox SQS batch send because cooperative shutdown budget is exhausted', {
             selectedCount: messages.length,
           });
           return emptyPublishStats();
@@ -264,20 +286,18 @@ export class OutboxPublisherService implements OnApplicationBootstrap, OnModuleD
             }
           }
           for (const failure of response.Failed ?? []) {
-            this.logger.warn({
-              message: 'Outbox event rejected by SQS SendMessageBatch',
+            this.safeLog('warn', 'Outbox event rejected by SQS SendMessageBatch', {
               eventId: failure.Id,
+              walletId: messages.find((msg) => msg.id === failure.Id)?.aggregateId,
               code: failure.Code,
               senderFault: failure.SenderFault,
-              reason: failure.Message,
             });
           }
         } catch (error) {
           this.integrationQueueUrl = undefined;
-          this.logger.warn({
-            message: 'Outbox SQS batch send failed; scheduling retry for locked head events',
+          this.safeLog('warn', 'Outbox SQS batch send failed; scheduling retry for locked head events', {
             batchCount: messages.length,
-            reason: error instanceof Error ? error.message : String(error),
+            ...safeErrorFields(error),
           });
         } finally {
           budget.dispose();
@@ -311,10 +331,9 @@ export class OutboxPublisherService implements OnApplicationBootstrap, OnModuleD
             failed += 1;
             if (msg.isQuarantined()) {
               quarantined += 1;
-              this.logger.error({
-                message: 'Outbox head event quarantined after reaching max automatic attempts',
+              this.safeLog('error', 'Outbox head event quarantined after reaching max automatic attempts', {
                 eventId: msg.id,
-                aggregateId: msg.aggregateId,
+                walletId: msg.aggregateId,
                 eventType: msg.eventType,
                 attempts: msg.attempts,
               });
@@ -347,10 +366,9 @@ export class OutboxPublisherService implements OnApplicationBootstrap, OnModuleD
     batchSize: number,
     cause: unknown,
   ): Promise<PublishBatchStats> {
-    this.logger.warn({
-      message: 'Failed to resolve SQS integration events queue URL',
+    this.safeLog('warn', 'Failed to resolve SQS integration events queue URL', {
       queueName: this.config.integrationEventsQueue,
-      reason: cause instanceof Error ? cause.message : String(cause),
+      ...safeErrorFields(cause),
     });
 
     return this.orm.em.fork().transactional(
@@ -465,16 +483,63 @@ export class OutboxPublisherService implements OnApplicationBootstrap, OnModuleD
     return work();
   }
 
+  private recordCommittedOutboxRetries(stats: PublishBatchStats): void {
+    guardMetrics(() => {
+      const retries = stats.failed - stats.quarantined;
+      if (!Number.isInteger(retries) || retries <= 0) {
+        return;
+      }
+      for (let index = 0; index < retries; index += 1) {
+        this.metrics?.increment('wager_retries_total', { channel: 'outbox', cause: 'infrastructure' });
+      }
+    });
+  }
+
+  private async sampleOutboxLag(): Promise<void> {
+    if (this.metrics === undefined) {
+      return;
+    }
+    const now = performance.now();
+    if (now - this.lastOutboxLagSampleAt < OUTBOX_LAG_SAMPLE_INTERVAL_MS) {
+      return;
+    }
+    this.lastOutboxLagSampleAt = now;
+    try {
+      const rows = await this.orm.em.fork().execute<{ lag_ms: string | number | bigint | null }[]>(
+        OUTBOX_OLDEST_UNPUBLISHED_LAG_SQL,
+      );
+      this.metrics.set('wager_outbox_lag_ms', outboxLagMilliseconds(rows[0]?.lag_ms));
+    } catch {
+      // Sampling must not publish, retry, or change the previous gauge.
+    }
+  }
+
+  private safeLog(level: 'warn' | 'error', message: string, fields: object): void {
+    try {
+      if (level === 'warn') {
+        this.logger.warn(message, fields);
+        return;
+      }
+      this.logger.error(message, fields);
+    } catch {
+      // Logging must not roll back a committed or in-flight outbox batch.
+    }
+  }
+
   private async runLoop(): Promise<void> {
     while (this.running && this.shutdown?.isShuttingDown() !== true) {
+      await this.sampleOutboxLag();
       let stats: PublishBatchStats | undefined;
       try {
         stats = await this.publishBatch();
       } catch (error) {
-        this.logger.error({
-          message: 'Outbox publisher cycle failed',
-          reason: error instanceof Error ? error.message : String(error),
+        const sqlstate = lockConflictSqlState(error);
+        guardMetrics(() => {
+          if (sqlstate !== undefined) {
+            this.metrics?.increment('wager_lock_conflicts_total', { sqlstate });
+          }
         });
+        this.safeLog('error', 'Outbox publisher cycle failed', safeErrorFields(error));
       }
 
       if (!this.running || this.shutdown?.isShuttingDown() === true) {

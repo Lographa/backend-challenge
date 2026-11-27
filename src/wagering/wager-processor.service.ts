@@ -6,6 +6,7 @@ import { DomainError, InvalidStateError } from '../common/errors/domain.error';
 import { FailureCode } from '../common/errors/failure-code';
 import { SERVICE_UNAVAILABLE_CODE } from '../common/http/domain-exception.filter';
 import { ShutdownService } from '../common/http/shutdown.service';
+import { guardMetrics, MetricsRegistry, recordStatusTransition } from '../common/observability/metrics';
 import { isUuid, newId } from '../common/ids';
 import type { EventContext, IntegrationEvent } from '../common/messaging/integration-event';
 import { WagerTransactionRecord, WalletLedgerEntryRecord, WalletRecord } from '../database/entities';
@@ -88,6 +89,7 @@ export class WagerProcessorService {
     private readonly orm: MikroORM,
     @Optional() private readonly config?: AppConfig,
     @Optional() private readonly shutdown?: ShutdownService,
+    @Optional() private readonly metrics?: MetricsRegistry,
   ) {}
 
   /** Entry point when the caller does not already own a SQL transaction (HTTP). */
@@ -100,12 +102,44 @@ export class WagerProcessorService {
         walletId: command.walletId,
         correlationId: command.correlationId,
       },
-      () =>
-        this.orm.em.fork().transactional(
-          (txEm) => this.processInTransaction(txEm, command),
-          { isolationLevel: IsolationLevel.READ_COMMITTED },
-        ),
+      async () => {
+        const started = performance.now();
+        try {
+          const result = await this.orm.em.fork().transactional(
+            (txEm) => this.processInTransaction(txEm, command),
+            { isolationLevel: IsolationLevel.READ_COMMITTED },
+          );
+          this.recordHttpOutcome(result, started, 'completed');
+          return result;
+        } catch (error) {
+          this.recordHttpFailure(error, started);
+          throw error;
+        }
+      },
     );
+  }
+
+  private recordHttpOutcome(result: ProcessWagerResult, started: number, outcome: 'completed' | 'error'): void {
+    guardMetrics(() => {
+      this.metrics?.observe('wager_processing_duration_ms', performance.now() - started, { channel: 'http', outcome });
+      if (result.idempotentReplay) {
+        this.metrics?.increment('wager_duplicates_total', { cause: 'idempotency_replay' });
+        return;
+      }
+      recordStatusTransition(this.metrics, result.transaction.status);
+    });
+  }
+
+  private recordHttpFailure(error: unknown, started: number): void {
+    guardMetrics(() => {
+      this.metrics?.observe('wager_processing_duration_ms', performance.now() - started, {
+        channel: 'http',
+        outcome: 'error',
+      });
+      if (error instanceof DomainError && error.code === FailureCode.IdempotencyPayloadConflict) {
+        this.metrics?.increment('wager_hash_conflicts_total', { cause: 'idempotency' });
+      }
+    });
   }
 
   /**

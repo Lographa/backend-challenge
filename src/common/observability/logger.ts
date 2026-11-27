@@ -30,6 +30,7 @@ export function createLogger(level: LogLevel, instanceId?: string): ConsoleLogge
     {
       json: true,
       colors: false,
+      flattenParams: true,
       logLevels: SEVERITY.slice(0, SEVERITY.indexOf(level) + 1),
     },
     instanceId,

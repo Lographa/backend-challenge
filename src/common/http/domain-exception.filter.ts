@@ -1,10 +1,11 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { DriverException } from '@mikro-orm/core';
-import { type ArgumentsHost, Catch, HttpException, HttpStatus, Logger } from '@nestjs/common';
+import { type ArgumentsHost, Catch, HttpException, HttpStatus, Inject, Logger, Optional } from '@nestjs/common';
 import { BaseExceptionFilter } from '@nestjs/core';
 import { DomainError } from '../errors/domain.error';
 import { FailureCode } from '../errors/failure-code';
-import { isTransientInfrastructureError } from '../errors/transient-error';
+import { isTransientInfrastructureError, lockConflictSqlState } from '../errors/transient-error';
+import { safeErrorFields } from '../observability/log-fields';
+import { guardMetrics, MetricsRegistry } from '../observability/metrics';
 import { assignCorrelationId } from './correlation';
 
 /**
@@ -80,6 +81,10 @@ export function errorResponse(error: unknown, correlationId: string): ErrorRespo
 export class DomainExceptionFilter extends BaseExceptionFilter<unknown> {
   private readonly logger = new Logger(DomainExceptionFilter.name);
 
+  constructor(@Optional() @Inject(MetricsRegistry) private readonly metrics?: MetricsRegistry) {
+    super();
+  }
+
   override catch(exception: unknown, host: ArgumentsHost): void {
     const http = host.switchToHttp();
     const request = http.getRequest<IncomingMessage>();
@@ -112,23 +117,28 @@ export class DomainExceptionFilter extends BaseExceptionFilter<unknown> {
     request: IncomingMessage,
     correlationId: string,
   ): void {
-    const error = exception instanceof Error ? exception : undefined;
-    const entry = {
-      message: 'Request failed',
+    const sqlstate = lockConflictSqlState(exception);
+    guardMetrics(() => {
+      if (sqlstate !== undefined) {
+        this.metrics?.increment('wager_lock_conflicts_total', { sqlstate });
+      }
+    });
+    const fields = {
       correlationId,
       method: request.method,
       path: request.url?.split('?')[0],
       status,
       code,
-      errorName: error?.name,
-      errorCode: (error as { code?: unknown } | undefined)?.code,
-      // Driver messages embed the SQL statement and its parameters.
-      ...(error !== undefined && !(error instanceof DriverException) ? { reason: error.message } : {}),
+      ...safeErrorFields(exception),
     };
-    if (status === HttpStatus.SERVICE_UNAVAILABLE) {
-      this.logger.warn(entry);
-    } else {
-      this.logger.error(entry);
+    try {
+      if (status === HttpStatus.SERVICE_UNAVAILABLE) {
+        this.logger.warn('Request failed', fields);
+      } else {
+        this.logger.error('Request failed', fields);
+      }
+    } catch {
+      // Logging must not change the HTTP response already decided above.
     }
   }
 }

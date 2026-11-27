@@ -13,6 +13,7 @@ import {
 import { HttpAdapterHost } from '@nestjs/core';
 import { AppConfig } from '../config/env';
 import { INSTANCE_ID_HEADER } from '../instance/instance-identity';
+import { MetricsRegistry } from '../observability/metrics';
 import { assignCorrelationId } from './correlation';
 import { SERVICE_UNAVAILABLE_CODE } from './domain-exception.filter';
 
@@ -147,6 +148,7 @@ export class ShutdownService implements BeforeApplicationShutdown {
   constructor(
     private readonly config: AppConfig,
     @Optional() private readonly httpAdapterHost?: HttpAdapterHost,
+    @Optional() private readonly metrics?: MetricsRegistry,
   ) {}
 
   /** Overrides the monotonic clock in unit/integration tests without relying on wall-clock sleeps. */
@@ -300,7 +302,21 @@ export class ShutdownService implements BeforeApplicationShutdown {
       markResponseConnectionClose(res);
     }
     this.closeIdleHttpConnections();
+    try {
+      this.metrics?.stopPeriodicSnapshot();
+    } catch {
+      // Stopping the snapshot timer must not change shutdown deadlines or in-flight counters.
+    }
     return true;
+  }
+
+  /** Last in-memory sample after the drain. Does not query the database and does not reset counters. */
+  emitFinalMetricsSnapshot(): void {
+    try {
+      this.metrics?.emitFinalSnapshot();
+    } catch {
+      // The final snapshot must not change the shutdown exit path.
+    }
   }
 
   recordRejectedHttpRequest(): void {
@@ -956,6 +972,7 @@ export function createProcessShutdownController(options: ProcessShutdownHandlerO
         shutdownSummary: shutdown.shutdownSummary(),
       });
       app.flushLogs();
+      // Hard timeout exits before the coordinated finally, so there is no final metrics snapshot.
       exitProcess(1);
     }, watchdogDelayMs);
   };
@@ -989,6 +1006,7 @@ export function createProcessShutdownController(options: ProcessShutdownHandlerO
         }
         detachListeners();
         shutdown.markShutdownCompleted();
+        shutdown.emitFinalMetricsSnapshot();
 
         if (shutdown.hasFailed()) {
           if (options.onExit === undefined) {

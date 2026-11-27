@@ -2,7 +2,10 @@ import { IsolationLevel } from '@mikro-orm/core';
 import { MikroORM } from '@mikro-orm/postgresql';
 import { Injectable, Logger, type OnApplicationBootstrap, type OnModuleDestroy, Optional } from '@nestjs/common';
 import { AppConfig } from '../common/config/env';
+import { lockConflictSqlState } from '../common/errors/transient-error';
 import { ShutdownService } from '../common/http/shutdown.service';
+import { safeErrorFields } from '../common/observability/log-fields';
+import { guardMetrics, MetricsRegistry, recordStatusTransition } from '../common/observability/metrics';
 import { computeJitteredDelayMs } from '../common/instance/instance-identity';
 import {
   type PendingReferencePolicy,
@@ -47,6 +50,7 @@ export class PendingReferenceWorker implements OnApplicationBootstrap, OnModuleD
     private readonly processor: WagerProcessorService,
     private readonly config: AppConfig,
     @Optional() private readonly shutdown?: ShutdownService,
+    @Optional() private readonly metrics?: MetricsRegistry,
   ) {}
 
   onApplicationBootstrap(): void {
@@ -169,8 +173,20 @@ export class PendingReferenceWorker implements OnApplicationBootstrap, OnModuleD
       if (this.stopping || this.shutdown?.isShuttingDown() === true) {
         break;
       }
+      const started = performance.now();
       try {
         const result = await this.resolveOne(candidate.id, candidate.wallet_id, options);
+        guardMetrics(() => {
+          this.metrics?.observe('wager_processing_duration_ms', performance.now() - started, {
+            channel: 'pending_reference',
+            outcome: 'completed',
+          });
+          if (result.outcome === 'resolved') {
+            recordStatusTransition(this.metrics, result.transaction.status);
+          } else if (result.outcome === 'rescheduled') {
+            this.metrics?.increment('wager_retries_total', { channel: 'pending_reference', cause: 'business' });
+          }
+        });
         if (result.outcome === 'resolved') {
           resolved += 1;
         } else if (result.outcome === 'rescheduled') {
@@ -180,12 +196,25 @@ export class PendingReferenceWorker implements OnApplicationBootstrap, OnModuleD
         }
       } catch (error) {
         failed += 1;
-        this.logger.error({
-          message: 'Failed to process pending reference transaction',
-          transactionId: candidate.id,
-          walletId: candidate.wallet_id,
-          reason: error instanceof Error ? error.message : String(error),
+        const sqlstate = lockConflictSqlState(error);
+        guardMetrics(() => {
+          this.metrics?.observe('wager_processing_duration_ms', performance.now() - started, {
+            channel: 'pending_reference',
+            outcome: 'error',
+          });
+          if (sqlstate !== undefined) {
+            this.metrics?.increment('wager_lock_conflicts_total', { sqlstate });
+          }
         });
+        try {
+          this.logger.error('Failed to process pending reference transaction', {
+            transactionId: candidate.id,
+            walletId: candidate.wallet_id,
+            ...safeErrorFields(error),
+          });
+        } catch {
+          // Logging must not change the batch counters already recorded above.
+        }
       }
     }
 
@@ -219,10 +248,17 @@ export class PendingReferenceWorker implements OnApplicationBootstrap, OnModuleD
       try {
         stats = await this.processDueBatch({ batchSize: DEFAULT_BATCH_SIZE });
       } catch (error) {
-        this.logger.error({
-          message: 'PendingReferenceWorker scan cycle failed',
-          reason: error instanceof Error ? error.message : String(error),
+        const sqlstate = lockConflictSqlState(error);
+        guardMetrics(() => {
+          if (sqlstate !== undefined) {
+            this.metrics?.increment('wager_lock_conflicts_total', { sqlstate });
+          }
         });
+        try {
+          this.logger.error('PendingReferenceWorker scan cycle failed', safeErrorFields(error));
+        } catch {
+          // A scan-log failure must not stop the worker loop.
+        }
       }
 
       if (!this.running || this.shutdown?.isShuttingDown() === true) {

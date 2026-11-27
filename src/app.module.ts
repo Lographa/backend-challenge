@@ -11,6 +11,7 @@ import { ConfigModule } from './common/config/config.module';
 import type { AppConfig } from './common/config/env';
 import { HealthModule } from './common/health/health.module';
 import { correlationMiddleware } from './common/http/correlation';
+import { ObservabilityModule } from './common/observability/observability.module';
 import { DomainExceptionFilter } from './common/http/domain-exception.filter';
 import { createHttpDrainMiddleware, ShutdownModule, ShutdownService } from './common/http/shutdown.service';
 import { DatabaseModule } from './database/database.module';
@@ -27,6 +28,7 @@ export class AppModule implements NestModule, OnModuleDestroy {
       module: AppModule,
       imports: [
         ConfigModule.forRoot(config),
+        ObservabilityModule.forRoot(),
         ShutdownModule,
         DatabaseModule,
         MessagingModule,

@@ -136,6 +136,37 @@ describe('Instance identity, PORT=0 binding, logger attribution, and ORM applica
     expect(first.pid).toBe(process.pid);
     expect(second.instanceId).toBeUndefined();
   });
+
+  test('createLogger flattens structured fields onto the JSON log object', () => {
+    const captured: string[] = [];
+    const original = process.stdout.write.bind(process.stdout);
+    process.stdout.write = ((chunk: string | Uint8Array): boolean => {
+      captured.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8'));
+      return true;
+    }) as typeof process.stdout.write;
+
+    try {
+      createLogger('log', 'node-42').warn('Wallet balance diverges from its ledger', {
+        correlationId: 'corr-1',
+        walletId: 'wallet-1',
+        checkedEntries: 1,
+      });
+    } finally {
+      process.stdout.write = original;
+    }
+
+    const flat = JSON.parse(captured[0]!) as Record<string, unknown>;
+    expect(flat.message).toBe('Wallet balance diverges from its ledger');
+    expect(flat.correlationId).toBe('corr-1');
+    expect(flat.walletId).toBe('wallet-1');
+    expect(flat.checkedEntries).toBe(1);
+    expect(flat.instanceId).toBe('node-42');
+    expect(flat.difference).toBeUndefined();
+    expect(flat.storedBalance).toBeUndefined();
+    expect(flat.calculatedBalance).toBeUndefined();
+    expect(JSON.stringify(flat)).not.toMatch(/\d+\.\d{2}/);
+    expect(JSON.stringify(flat).toLowerCase()).not.toContain('brl');
+  });
 });
 
 describe('BatchVisibilityLeaseManager — SQS visibility heartbeat, FIFO wave renewal, and ownership loss', () => {

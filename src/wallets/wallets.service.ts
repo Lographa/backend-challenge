@@ -5,6 +5,8 @@ import { DomainError } from '../common/errors/domain.error';
 import { FailureCode } from '../common/errors/failure-code';
 import { SERVICE_UNAVAILABLE_CODE } from '../common/http/domain-exception.filter';
 import { ShutdownService } from '../common/http/shutdown.service';
+import { definedFields } from '../common/observability/log-fields';
+import { guardMetrics, MetricsRegistry } from '../common/observability/metrics';
 import { isUuid, newId } from '../common/ids';
 import type { EventContext } from '../common/messaging/integration-event';
 import type { Money } from '../common/money/money';
@@ -33,6 +35,7 @@ export class WalletsService {
   constructor(
     private readonly orm: MikroORM,
     @Optional() private readonly shutdown?: ShutdownService,
+    @Optional() private readonly metrics?: MetricsRegistry,
   ) {}
 
   /**
@@ -90,6 +93,11 @@ export class WalletsService {
         }
         throw error;
       }
+      if (openingId !== undefined) {
+        guardMetrics(() => {
+          this.metrics?.increment('wager_transaction_status_transitions_total', { status: 'PROCESSED' });
+        });
+      }
       return openedWallet;
     });
   }
@@ -144,13 +152,21 @@ export class WalletsService {
         { isolationLevel: IsolationLevel.REPEATABLE_READ, readOnly: true },
       );
       if (!report.consistent) {
-        this.logger.warn({
-          message: 'Wallet balance diverges from its ledger',
-          correlationId,
-          walletId,
-          checkedEntries: report.checkedEntries,
-          difference: report.difference.amount,
+        guardMetrics(() => {
+          this.metrics?.increment('wallet_reconciliation_mismatch_total');
         });
+        try {
+          this.logger.warn(
+            'Wallet balance diverges from its ledger',
+            definedFields({
+              correlationId,
+              walletId,
+              checkedEntries: report.checkedEntries,
+            }),
+          );
+        } catch {
+          // A log failure must still return the read-only reconciliation report.
+        }
       }
       return report;
     });
